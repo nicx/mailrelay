@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Optionaler Autostart beim Login.
+  Einfacher Weg ohne diese Datei: MailRelay.app einmal starten, dann
+  Systemeinstellungen > Allgemein > Anmeldeobjekte > MailRelay hinzufügen.
+
+  Wenn du diese Datei nutzen willst:
+    1. PFAD unten anpassen (Standard: /Applications/MailRelay.app)
+    2. nach ~/Library/LaunchAgents/ kopieren
+    3. launchctl load ~/Library/LaunchAgents/com.github.mailrelay.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.github.mailrelay</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/open</string>
+        <string>-a</string>
+        <string>/Applications/MailRelay.app</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>

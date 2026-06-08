@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# py2app
+build/
+dist/
+assets/icon.icns
+
+# macOS
+.DS_Store
+
+# Interne Build-Anleitung (nicht Teil des Projekts)
+CLAUDE.md
