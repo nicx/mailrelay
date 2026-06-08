@@ -11,7 +11,8 @@ man stattdessen etwas Natives mit GUI direkt auf dem Mac möchte – ohne Docker
 
 ## Features
 
-- Menüleisten-App (✉︎), kein Dock-Icon (`LSUIElement`)
+- Menüleisten-App mit eigenem Icon (monochromes Template, passt sich Hell/Dunkel
+  an; Sende-Pfeil bei laufendem Relay), kein Dock-Icon (`LSUIElement`)
 - SMTP-Listener auf konfigurierbarem Host/Port (Default `127.0.0.1:2525`)
 - Persistente Disk-Queue mit Retry und exponentiellem Backoff
 - Upstream mit STARTTLS (587), SSL (465) oder Plain (25)
@@ -54,15 +55,59 @@ Queue/Log: gleiches Verzeichnis (`spool/`, `failed/`, `mailrelay.log`).
 
 ### Hinweise
 
-- **Port 25** bräuchte root. Entweder Clients auf `2525` umstellen oder per
-  `pfctl` 25 → 2525 umleiten.
-- Sollen andere Geräte im LAN relayen, Listen-Host auf `0.0.0.0` setzen.
+- Sollen andere Geräte im LAN relayen, Listen-Host auf `0.0.0.0` setzen
+  (statt `127.0.0.1`, das nur lokale Verbindungen annimmt).
+
+## Port 25 nutzen (pf-Umleitung)
+
+Ports unter 1024 sind **privilegiert** – nur Prozesse als `root` dürfen sich
+darauf binden. MailRelay läuft als normale Benutzer-App und kann Port 25 daher
+nicht direkt belegen (Start scheitert mit „Start fehlgeschlagen“). Der saubere
+Weg: Die App bleibt auf dem unprivilegierten Port **2525**, und macOS leitet
+eingehenden Verkehr von Port 25 dorthin um – über die eingebaute Firewall `pf`.
+
+**1. App-Einstellungen** (Menü → Einstellungen):
+
+- Listen-Port: `2525` (**nicht** `25`)
+- Listen-Host: `0.0.0.0`, damit andere Geräte im LAN senden können
+
+**2. Umleitungsregel anlegen** – Datei `/etc/pf.anchors/mailrelay`:
+
+```
+rdr pass inet proto tcp from any to any port 25 -> 127.0.0.1 port 2525
+```
+
+**3. Regel laden** (einmalig `sudo`, da Systemeingriff):
+
+```bash
+sudo pfctl -ef /etc/pf.anchors/mailrelay   # pf aktivieren + Regel laden
+sudo pfctl -sn                             # Kontrolle: rdr-Regel sichtbar?
+```
+
+**4. Persistent über Neustarts** (optional): Ein **LaunchDaemon** unter
+`/Library/LaunchDaemons/` lädt die Regel beim Boot als root erneut
+(`pfctl -ef /etc/pf.anchors/mailrelay`) – sonst ist sie nach einem Reboot weg.
+
+### Stolpersteine
+
+- **macOS-Firewall:** Beim ersten Start ggf. „Eingehende Verbindungen erlauben“
+  bestätigen (Systemeinstellungen → Netzwerk → Firewall).
+- **Provider blockieren Port 25:** Im LAN unkritisch; aus dem Internet sperren
+  die meisten ISPs eingehenden Port 25 – das liegt dann nicht an MailRelay.
+- **`0.0.0.0` öffnet den Listener für alle erreichbaren Geräte.** MailRelay
+  verlangt *eingehend* keine Authentifizierung – nur in vertrauenswürdigen
+  Netzen nutzen oder per Firewall auf bekannte Absender-IPs einschränken.
 
 ## Autostart
 
-Am einfachsten über **Systemeinstellungen → Allgemein → Anmeldeobjekte**.
-Alternativ das Template unter `launchagent/` anpassen und nach
-`~/Library/LaunchAgents/` kopieren.
+Am einfachsten direkt in der App: **Einstellungen → „Beim Login starten“**
+aktivieren. Das richtet automatisch einen LaunchAgent ein
+(`~/Library/LaunchAgents/com.github.mailrelay.plist`) und entfernt ihn beim
+Deaktivieren wieder.
+
+Alternativ über **Systemeinstellungen → Allgemein → Anmeldeobjekte**, oder das
+Template unter `launchagent/` anpassen und nach `~/Library/LaunchAgents/`
+kopieren.
 
 ## Lizenz
 
