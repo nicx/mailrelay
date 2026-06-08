@@ -22,6 +22,7 @@ import uuid
 import base64
 import smtplib
 import logging
+import plistlib
 import threading
 import subprocess
 from pathlib import Path
@@ -56,6 +57,56 @@ def resource_path(name):
 # Menüleisten-Symbole (monochrome Template-Icons, passen sich Hell/Dunkel an)
 ICON_IDLE = resource_path("menubar.png")          # Relay gestoppt
 ICON_ACTIVE = resource_path("menubar-active.png")  # Relay läuft
+
+
+# --------------------------------------------------------- Login-Autostart ---
+LOGIN_LABEL = "com.github.mailrelay"
+LAUNCH_AGENTS = Path.home() / "Library" / "LaunchAgents"
+LOGIN_PLIST = LAUNCH_AGENTS / f"{LOGIN_LABEL}.plist"
+
+
+def app_bundle_path():
+    """Pfad zur .app, wenn aus dem Bundle gestartet; sonst None (Quelltext)."""
+    if getattr(sys, "frozen", False):
+        # …/MailRelay.app/Contents/MacOS/<exe> -> parents[2] = …/MailRelay.app
+        return Path(sys.executable).resolve().parents[2]
+    return None
+
+
+def login_item_enabled():
+    """True, wenn der LaunchAgent für den Login-Autostart installiert ist."""
+    return LOGIN_PLIST.exists()
+
+
+def set_login_item(enabled):
+    """Login-Autostart über einen LaunchAgent ein-/ausschalten.
+
+    Wirft RuntimeError, wenn aus dem Quelltext gestartet (keine .app vorhanden).
+    """
+    if enabled:
+        bundle = app_bundle_path()
+        if bundle is None:
+            raise RuntimeError(
+                "Login-Autostart funktioniert nur mit der installierten "
+                "MailRelay.app, nicht beim Start aus dem Quelltext."
+            )
+        LAUNCH_AGENTS.mkdir(parents=True, exist_ok=True)
+        # open -a ist absichtlich gewählt: läuft die App schon, wird die
+        # bestehende Instanz aktiviert statt eine zweite zu starten.
+        data = {
+            "Label": LOGIN_LABEL,
+            "ProgramArguments": ["/usr/bin/open", "-a", str(bundle)],
+            "RunAtLoad": True,
+        }
+        with open(LOGIN_PLIST, "wb") as f:
+            plistlib.dump(data, f)
+        subprocess.run(["launchctl", "unload", str(LOGIN_PLIST)], capture_output=True)
+        subprocess.run(["launchctl", "load", "-w", str(LOGIN_PLIST)], capture_output=True)
+    else:
+        if LOGIN_PLIST.exists():
+            subprocess.run(["launchctl", "unload", "-w", str(LOGIN_PLIST)], capture_output=True)
+            LOGIN_PLIST.unlink(missing_ok=True)
+
 
 DEFAULTS = {
     "listen_host": "127.0.0.1",   # auf 0.0.0.0 setzen, wenn andere LAN-Geräte relayen sollen
@@ -241,6 +292,9 @@ class MailRelayApp(rumps.App):
         self.tls_item = rumps.MenuItem("STARTTLS verwenden", callback=self.toggle_tls)
         self.tls_item.state = 1 if self.cfg.get("use_starttls", True) else 0
 
+        self.login_item = rumps.MenuItem("Beim Login starten", callback=self.toggle_login_item)
+        self.login_item.state = 1 if login_item_enabled() else 0
+
         settings = rumps.MenuItem("Einstellungen")
         settings.update([
             rumps.MenuItem("Listen-Host…", callback=self.set_listen_host),
@@ -252,6 +306,7 @@ class MailRelayApp(rumps.App):
             rumps.MenuItem("Passwort…", callback=self.set_password),
             self.tls_item,
             None,
+            self.login_item,
             rumps.MenuItem("Konfigurationsdatei öffnen…", callback=self.open_config),
         ])
 
@@ -391,6 +446,16 @@ class MailRelayApp(rumps.App):
         sender.state = 0 if sender.state else 1
         self.cfg["use_starttls"] = bool(sender.state)
         save_config(self.cfg)
+
+    def toggle_login_item(self, sender):
+        want = not bool(sender.state)
+        try:
+            set_login_item(want)
+        except Exception as e:
+            rumps.alert(APP_NAME, f"Login-Autostart konnte nicht geändert werden:\n{e}")
+            return
+        sender.state = 1 if want else 0
+        self.log.info("Login-Autostart: %s", "ein" if want else "aus")
 
     # ----------------------------------------------------------- Aktionen
     def flush_now(self, _):
