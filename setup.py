@@ -15,6 +15,8 @@ OPTIONS = {
     "argv_emulation": False,
     "iconfile": "assets/icon.icns",
     "packages": ["rumps", "aiosmtpd"],
+    # Menüleisten-Template-Icons landen in Contents/Resources/
+    "resources": ["assets/menubar.png", "assets/menubar-active.png"],
     "plist": {
         "CFBundleName": "MailRelay",
         "CFBundleDisplayName": "MailRelay",

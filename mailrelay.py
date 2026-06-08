@@ -15,6 +15,7 @@ Start:
 
 import os
 import ssl
+import sys
 import json
 import time
 import uuid
@@ -37,6 +38,24 @@ FAILED = SUPPORT / "failed"
 CONFIG_PATH = SUPPORT / "config.json"
 LOG_PATH = SUPPORT / "mailrelay.log"
 KEYCHAIN_SERVICE = "MailRelay-upstream"
+
+
+def resource_path(name):
+    """Absoluter Pfad zu einer gebündelten Ressource.
+
+    Funktioniert aus dem Quelltext (./assets/<name>) wie auch aus der gebauten
+    py2app-.app (dort liegen Ressourcen unter Contents/Resources/<name>).
+    """
+    if getattr(sys, "frozen", False):
+        base = Path(sys.executable).resolve().parent.parent / "Resources"
+    else:
+        base = Path(__file__).resolve().parent / "assets"
+    return str(base / name)
+
+
+# Menüleisten-Symbole (monochrome Template-Icons, passen sich Hell/Dunkel an)
+ICON_IDLE = resource_path("menubar.png")          # Relay gestoppt
+ICON_ACTIVE = resource_path("menubar-active.png")  # Relay läuft
 
 DEFAULTS = {
     "listen_host": "127.0.0.1",   # auf 0.0.0.0 setzen, wenn andere LAN-Geräte relayen sollen
@@ -204,7 +223,7 @@ class RelayWorker(threading.Thread):
 # --------------------------------------------------------------- Menü-App ---
 class MailRelayApp(rumps.App):
     def __init__(self):
-        super().__init__(APP_NAME, title="✉︎", quit_button=None)
+        super().__init__(APP_NAME, icon=ICON_IDLE, template=True, quit_button=None)
         SUPPORT.mkdir(parents=True, exist_ok=True)
         SPOOL.mkdir(parents=True, exist_ok=True)
         self.log = setup_logging()
@@ -295,7 +314,7 @@ class MailRelayApp(rumps.App):
             f"Status: läuft ({self.cfg['listen_host']}:{self.cfg['listen_port']})"
         )
         self.toggle_item.title = "Stop"
-        self.title = "✉️"
+        self.icon = ICON_ACTIVE
         self.log.info("Relay gestartet auf %s:%s",
                       self.cfg["listen_host"], self.cfg["listen_port"])
 
@@ -308,7 +327,7 @@ class MailRelayApp(rumps.App):
             self.worker = None
         self.status_item.title = "Status: gestoppt"
         self.toggle_item.title = "Start"
-        self.title = "✉︎"
+        self.icon = ICON_IDLE
         self.log.info("Relay gestoppt")
 
     def toggle(self, _):
