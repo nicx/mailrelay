@@ -10,7 +10,7 @@ macOS-Schlüsselbund (Keychain), nicht im Klartext.
 Setup:
     python3 -m pip install --user rumps aiosmtpd
 Start:
-    python3 mailrelay.py        # erscheint als ✉︎ in der Menüleiste
+    python3 mailrelay.py        # erscheint als Briefumschlag-Icon in der Menüleiste
 """
 
 import os
