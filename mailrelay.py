@@ -23,6 +23,7 @@ import base64
 import smtplib
 import logging
 import plistlib
+import ipaddress
 import threading
 import subprocess
 from pathlib import Path
@@ -116,7 +117,59 @@ DEFAULTS = {
     "username": "",
     "use_starttls": True,
     "max_retries": 10,
+    "allowed_peers": [],          # leer = alle erlaubt; sonst Allowlist aus IPs/CIDR (H1)
 }
+
+# Sicherheits-Konstanten
+LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+MAX_QUEUE_FILES = 10000           # DoS-Schutz: Obergrenze der Warteschlange (M3)
+DIR_MODE = 0o700                  # Verzeichnisrechte: nur Eigentümer (M1)
+FILE_MODE = 0o600                 # Dateirechte: nur Eigentümer (M1)
+
+
+# ---------------------------------------------------- Datei-/Verzeichnisrechte ---
+def _chmod(path, mode):
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass
+
+
+def secure_dir(path):
+    """Verzeichnis anlegen und auf 0700 (nur Eigentümer) setzen."""
+    path.mkdir(parents=True, exist_ok=True)
+    _chmod(path, DIR_MODE)
+
+
+def write_private(path, text):
+    """Datei schreiben und auf 0600 (nur Eigentümer) setzen."""
+    path.write_text(text)
+    _chmod(path, FILE_MODE)
+
+
+def peer_allowed(peer, allowed):
+    """True, wenn die Peer-IP in der Allowlist (IPs/CIDR) liegt. Leere Liste -> alle."""
+    if not allowed:
+        return True
+    try:
+        ip = ipaddress.ip_address(peer[0])
+    except (ValueError, TypeError, IndexError):
+        return False
+    for entry in allowed:
+        try:
+            if ip in ipaddress.ip_network(entry, strict=False):
+                return True
+        except ValueError:
+            if str(peer[0]) == str(entry):
+                return True
+    return False
+
+
+def queue_count():
+    try:
+        return sum(1 for _ in SPOOL.glob("*.json"))
+    except OSError:
+        return 0
 
 
 # ---------------------------------------------------------------- Keychain ---
@@ -156,18 +209,19 @@ def load_config():
 
 
 def save_config(cfg):
-    SUPPORT.mkdir(parents=True, exist_ok=True)
-    CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+    secure_dir(SUPPORT)
+    write_private(CONFIG_PATH, json.dumps(cfg, indent=2))
 
 
 def setup_logging():
-    SUPPORT.mkdir(parents=True, exist_ok=True)
+    secure_dir(SUPPORT)
     log = logging.getLogger(APP_NAME)
     if not log.handlers:
         log.setLevel(logging.INFO)
         h = logging.FileHandler(LOG_PATH)
         h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
         log.addHandler(h)
+    _chmod(LOG_PATH, FILE_MODE)
     return log
 
 
@@ -175,11 +229,23 @@ def setup_logging():
 class RelayHandler:
     """Nimmt Mails an und legt sie auf die Disk-Queue."""
 
-    def __init__(self, spool_dir, log):
-        self.spool_dir = spool_dir
-        self.log = log
+    def __init__(self, app):
+        self.app = app
+        self.spool_dir = SPOOL
+        self.log = app.log
 
     async def handle_DATA(self, server, session, envelope):
+        # H1: optionale Peer-Allowlist gegen offenes Relay
+        allowed = self.app.cfg.get("allowed_peers") or []
+        if not peer_allowed(session.peer, allowed):
+            self.log.warning("Abgelehnt (Peer nicht in Allowlist): %s", session.peer)
+            return "550 Sender host not allowed"
+
+        # M3: Warteschlange begrenzen (DoS-Schutz)
+        if queue_count() >= MAX_QUEUE_FILES:
+            self.log.error("Warteschlange voll (>= %d) – Mail abgelehnt", MAX_QUEUE_FILES)
+            return "452 Insufficient system storage, try again later"
+
         rec = {
             "mailfrom": envelope.mail_from,
             "rcpttos": list(envelope.rcpt_tos),
@@ -188,7 +254,7 @@ class RelayHandler:
             "next_try": 0,
         }
         fn = self.spool_dir / f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}.json"
-        fn.write_text(json.dumps(rec))
+        write_private(fn, json.dumps(rec))
         self.log.info("Angenommen: %s -> %s (%s)",
                       envelope.mail_from, envelope.rcpt_tos, fn.name)
         return "250 Message accepted for delivery"
@@ -234,14 +300,14 @@ class RelayWorker(threading.Thread):
                     f.name, rec["attempts"], e, backoff,
                 )
                 if rec["attempts"] >= int(cfg.get("max_retries", 10)):
-                    FAILED.mkdir(parents=True, exist_ok=True)
+                    secure_dir(FAILED)
                     f.rename(FAILED / f.name)
                     self.app.log.error(
                         "Aufgegeben: %s nach %d Versuchen -> failed/",
                         f.name, rec["attempts"],
                     )
                 else:
-                    f.write_text(json.dumps(rec))
+                    write_private(f, json.dumps(rec))
 
     def deliver(self, cfg, rec):
         host = cfg.get("upstream_host", "")
@@ -250,18 +316,26 @@ class RelayWorker(threading.Thread):
             raise RuntimeError("kein Upstream-Host konfiguriert")
         data = base64.b64decode(rec["data"])
 
+        secure = False
         if port == 465:
             s = smtplib.SMTP_SSL(host, port, timeout=30,
                                  context=ssl.create_default_context())
+            secure = True
         else:
             s = smtplib.SMTP(host, port, timeout=30)
             s.ehlo()
             if cfg.get("use_starttls", True):
                 s.starttls(context=ssl.create_default_context())
                 s.ehlo()
+                secure = True
         try:
             user = cfg.get("username", "")
             if user:
+                # H2: Zugangsdaten niemals über eine unverschlüsselte Verbindung senden
+                if not secure:
+                    raise RuntimeError(
+                        "AUTH nur über TLS erlaubt – STARTTLS aktivieren oder Port 465 nutzen"
+                    )
                 s.login(user, keychain_get(user))
             s.sendmail(rec["mailfrom"], rec["rcpttos"], data)
         finally:
@@ -275,8 +349,8 @@ class RelayWorker(threading.Thread):
 class MailRelayApp(rumps.App):
     def __init__(self):
         super().__init__(APP_NAME, icon=ICON_IDLE, template=True, quit_button=None)
-        SUPPORT.mkdir(parents=True, exist_ok=True)
-        SPOOL.mkdir(parents=True, exist_ok=True)
+        secure_dir(SUPPORT)
+        secure_dir(SPOOL)
         self.log = setup_logging()
         self.cfg = load_config()
         save_config(self.cfg)
@@ -299,6 +373,7 @@ class MailRelayApp(rumps.App):
         settings.update([
             rumps.MenuItem("Listen-Host…", callback=self.set_listen_host),
             rumps.MenuItem("Listen-Port…", callback=self.set_listen_port),
+            rumps.MenuItem("Erlaubte Absender…", callback=self.set_allowed_peers),
             None,
             rumps.MenuItem("Upstream-Host…", callback=self.set_upstream_host),
             rumps.MenuItem("Upstream-Port…", callback=self.set_upstream_port),
@@ -351,7 +426,7 @@ class MailRelayApp(rumps.App):
         if self.controller:
             return
         try:
-            handler = RelayHandler(SPOOL, self.log)
+            handler = RelayHandler(self)
             self.controller = Controller(
                 handler,
                 hostname=self.cfg["listen_host"],
@@ -372,6 +447,19 @@ class MailRelayApp(rumps.App):
         self.icon = ICON_ACTIVE
         self.log.info("Relay gestartet auf %s:%s",
                       self.cfg["listen_host"], self.cfg["listen_port"])
+
+        # H1: Warnen, wenn nicht-lokal gebunden und keine Allowlist gesetzt ist
+        host = self.cfg["listen_host"]
+        if host not in LOOPBACK_HOSTS and not (self.cfg.get("allowed_peers") or []):
+            self.log.warning(
+                "OFFENES RELAY: lauscht auf %s ohne Peer-Allowlist – jedes "
+                "erreichbare Gerät kann über den Upstream versenden.", host
+            )
+            rumps.notification(
+                APP_NAME, "Sicherheitshinweis",
+                "Relay ist im Netz offen erreichbar. Unter Einstellungen → "
+                "„Erlaubte Absender…“ einschränken oder Listen-Host 127.0.0.1.",
+            )
 
     def stop_relay(self):
         if self.controller:
@@ -410,6 +498,29 @@ class MailRelayApp(rumps.App):
         if v is not None and v.isdigit():
             self.cfg["listen_port"] = int(v)
             save_config(self.cfg)
+            self._restart_hint()
+
+    def set_allowed_peers(self, _):
+        cur = ", ".join(self.cfg.get("allowed_peers") or [])
+        v = self.prompt(
+            "Erlaubte Absender als IP/CIDR, kommagetrennt\n"
+            "(leer = alle erlauben, z. B. 192.168.1.0/24, 10.0.0.5):",
+            cur,
+        )
+        if v is not None:
+            peers = [p.strip() for p in v.split(",") if p.strip()]
+            # Validierung: ungültige Einträge verwerfen und melden
+            valid, invalid = [], []
+            for p in peers:
+                try:
+                    ipaddress.ip_network(p, strict=False)
+                    valid.append(p)
+                except ValueError:
+                    invalid.append(p)
+            self.cfg["allowed_peers"] = valid
+            save_config(self.cfg)
+            if invalid:
+                rumps.alert(APP_NAME, "Ignoriert (keine gültige IP/CIDR):\n" + ", ".join(invalid))
             self._restart_hint()
 
     def set_upstream_host(self, _):
@@ -463,7 +574,7 @@ class MailRelayApp(rumps.App):
             try:
                 rec = json.loads(f.read_text())
                 rec["next_try"] = 0
-                f.write_text(json.dumps(rec))
+                write_private(f, json.dumps(rec))
             except Exception:
                 pass
         rumps.notification(APP_NAME, "", "Warteschlange wird jetzt erneut zugestellt.")

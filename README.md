@@ -17,6 +17,8 @@ man stattdessen etwas Natives mit GUI direkt auf dem Mac möchte – ohne Docker
 - Persistente Disk-Queue mit Retry und exponentiellem Backoff
 - Upstream mit STARTTLS (587), SSL (465) oder Plain (25)
 - Optionale SMTP-Authentifizierung; Passwort im Schlüsselbund
+- Sicherheit: TLS-Zwang für Upstream-AUTH, optionale Absender-Allowlist (IP/CIDR)
+  gegen offenes Relay, Queue/Log/Config nur für den eigenen Benutzer lesbar
 - Statusanzeige, Queue-Tiefe, „sofort erneut zustellen", Log-Zugriff im Menü
 
 ## Build (macOS)
@@ -95,8 +97,21 @@ sudo pfctl -sn                             # Kontrolle: rdr-Regel sichtbar?
 - **Provider blockieren Port 25:** Im LAN unkritisch; aus dem Internet sperren
   die meisten ISPs eingehenden Port 25 – das liegt dann nicht an MailRelay.
 - **`0.0.0.0` öffnet den Listener für alle erreichbaren Geräte.** MailRelay
-  verlangt *eingehend* keine Authentifizierung – nur in vertrauenswürdigen
-  Netzen nutzen oder per Firewall auf bekannte Absender-IPs einschränken.
+  verlangt *eingehend* keine Authentifizierung. Schränke daher die Absender ein:
+  **Einstellungen → „Erlaubte Absender…“** mit IP/CIDR füllen (z. B.
+  `192.168.1.0/24`) – dann werden alle anderen Geräte abgewiesen. Ist die Liste
+  leer und der Listener nicht-lokal, warnt die App beim Start vor dem offenen
+  Relay. Alternativ per Firewall einschränken.
+
+### Sicherheit (Kurzüberblick)
+
+- **AUTH nur über TLS:** Zugangsdaten werden nie über eine unverschlüsselte
+  Verbindung gesendet – nutze Port 465 (SSL) oder 587 mit STARTTLS.
+- **Absender-Allowlist** (IP/CIDR) gegen offenes Relay, s. o.
+- **Dateirechte:** `config.json`, `mailrelay.log` und die Queue (`spool/`,
+  `failed/`) gehören `0600`/`0700` – nur dein Benutzer kann sie lesen.
+- **Passwort** liegt im macOS-Schlüsselbund, nicht im Klartext.
+- Für „Daten at-rest“ (gequeuete Mails) zusätzlich **FileVault** aktivieren.
 
 ## Autostart
 
