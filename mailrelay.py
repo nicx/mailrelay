@@ -55,9 +55,8 @@ def resource_path(name):
     return str(base / name)
 
 
-# Menüleisten-Symbole (monochrome Template-Icons, passen sich Hell/Dunkel an)
-ICON_IDLE = resource_path("menubar.png")          # Relay gestoppt
-ICON_ACTIVE = resource_path("menubar-active.png")  # Relay läuft
+# Menüleisten-Symbol (monochromes Template-Icon, passt sich Hell/Dunkel an)
+ICON = resource_path("menubar.png")
 
 
 # --------------------------------------------------------- Login-Autostart ---
@@ -348,7 +347,7 @@ class RelayWorker(threading.Thread):
 # --------------------------------------------------------------- Menü-App ---
 class MailRelayApp(rumps.App):
     def __init__(self):
-        super().__init__(APP_NAME, icon=ICON_IDLE, template=True, quit_button=None)
+        super().__init__(APP_NAME, icon=ICON, template=True, quit_button=None)
         secure_dir(SUPPORT)
         secure_dir(SPOOL)
         self.log = setup_logging()
@@ -444,7 +443,6 @@ class MailRelayApp(rumps.App):
             f"Status: läuft ({self.cfg['listen_host']}:{self.cfg['listen_port']})"
         )
         self.toggle_item.title = "Stop"
-        self.icon = ICON_ACTIVE
         self.log.info("Relay gestartet auf %s:%s",
                       self.cfg["listen_host"], self.cfg["listen_port"])
 
@@ -470,7 +468,6 @@ class MailRelayApp(rumps.App):
             self.worker = None
         self.status_item.title = "Status: gestoppt"
         self.toggle_item.title = "Start"
-        self.icon = ICON_IDLE
         self.log.info("Relay gestoppt")
 
     def toggle(self, _):

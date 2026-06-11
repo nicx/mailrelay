@@ -11,9 +11,8 @@ man stattdessen etwas Natives mit GUI direkt auf dem Mac möchte – ohne Docker
 
 ## Features
 
-- Menüleisten-App mit eigenem Icon (monochromes Template, passt sich Hell/Dunkel
-  an; gefüllter Umschlag bei laufendem Relay, umrandet wenn gestoppt), kein
-  Dock-Icon (`LSUIElement`)
+- Menüleisten-App mit eigenem Icon (monochromer Umschlag-Outline als Template,
+  passt sich Hell/Dunkel an), kein Dock-Icon (`LSUIElement`)
 - SMTP-Listener auf konfigurierbarem Host/Port (Default `127.0.0.1:2525`)
 - Persistente Disk-Queue mit Retry und exponentiellem Backoff
 - Upstream mit STARTTLS (587), SSL (465) oder Plain (25)

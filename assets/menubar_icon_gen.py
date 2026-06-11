@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
 """
-Erzeugt die Menüleisten-Template-Icons für MailRelay.
+Erzeugt das Menüleisten-Template-Icon für MailRelay.
 
-Zwei Zustände, beide als schwarz-auf-transparent Template (macOS recolort sie
-automatisch für helle/dunkle Menüleiste):
-    menubar.png         -> Relay gestoppt  (Umschlag-Outline)
-    menubar-active.png  -> Relay läuft      (Umschlag gefüllt)
-
-Gefüllt vs. umrandet ist bei Menüleisten-Größe klar unterscheidbar – ohne einen
-zusätzlichen Punkt/Pfeil, der dort sonst nur wie ein Klecks wirkt. Geometrie in
-beiden Zuständen identisch, daher kein Sprung beim Start/Stop.
+Ein einziges schwarz-auf-transparentes Template-Icon (Umschlag-Outline); macOS
+recolort es automatisch für helle/dunkle Menüleiste:
+    menubar.png   -> Umschlag-Outline
 
 rumps rendert das Icon in einer festen 20x20-pt-Box; daher füllt der Umschlag
 die Zeichenfläche bewusst weitgehend aus, damit er so groß wirkt wie System-Icons.
@@ -39,7 +34,7 @@ def _p(*pts):
 
 
 def _outline():
-    """Relay gestoppt: nur die Umschlag-Kontur."""
+    """Umschlag-Kontur."""
     img = Image.new("RGBA", (SIZE * S, SIZE * S), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
     w = int(STROKE * S)
@@ -50,28 +45,12 @@ def _outline():
     return img
 
 
-def _filled():
-    """Relay läuft: gefüllter Umschlag mit ausgesparter Klappen-Linie."""
-    # Alpha-Maske bauen: Korpus voll, V-Klappe als Aussparung (Wert 0).
-    mask = Image.new("L", (SIZE * S, SIZE * S), 0)
-    md = ImageDraw.Draw(mask)
-    md.rounded_rectangle(_p((ENV_L, ENV_T), (ENV_R, ENV_B)),
-                         radius=RADIUS * S, fill=255)
-    md.line(_p((ENV_L, ENV_T), (MID_X, CY), (ENV_R, ENV_T)),
-            fill=0, width=int(STROKE * S), joint="curve")
-    img = Image.new("RGBA", mask.size, (0, 0, 0, 0))
-    img.paste((0, 0, 0, 255), (0, 0), mask)   # schwarz dort, wo Maske > 0
-    return img
-
-
-def build(active: bool):
-    img = (_filled() if active else _outline()).resize((SIZE, SIZE), Image.LANCZOS)
-    name = "menubar-active.png" if active else "menubar.png"
-    out = HERE / name
+def build():
+    img = _outline().resize((SIZE, SIZE), Image.LANCZOS)
+    out = HERE / "menubar.png"
     img.save(out)
     print("geschrieben:", out)
 
 
 if __name__ == "__main__":
-    build(active=False)
-    build(active=True)
+    build()
