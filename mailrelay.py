@@ -55,8 +55,60 @@ def resource_path(name):
     return str(base / name)
 
 
-# Menüleisten-Symbol (monochromes Template-Icon, passt sich Hell/Dunkel an)
+# Menüleisten-Symbol: bevorzugt das SF-System-Symbol „envelope" (gleiche Optik
+# und Größe wie System-Icons); als Fallback das gebündelte Outline-PNG.
 ICON = resource_path("menubar.png")
+
+# SF-Symbol bei 22 pt @2x – wie bei den Schwester-Apps (icloud-sync etc.)
+_SF_POINTS = 22
+_SF_SCALE = 2
+
+
+def render_sf_menubar_icon(symbol="envelope"):
+    """Rendert das SF-Symbol als Template-PNG nach App Support und gibt den Pfad
+    zurück. None, wenn nicht möglich (z. B. macOS < 11) -> Fallback auf ICON.
+
+    Quadratischer Bitmap-Rep mit erhaltenem Seitenverhältnis, weil rumps das
+    Menüleisten-Icon auf 20x20 zwingt; ein nicht-quadratisches Bild würde sonst
+    gestaucht.
+    """
+    try:
+        import AppKit
+        from Foundation import NSMakeRect, NSSize
+    except Exception:
+        return None
+    if not hasattr(AppKit.NSImage, "imageWithSystemSymbolName_accessibilityDescription_"):
+        return None
+    img = AppKit.NSImage.imageWithSystemSymbolName_accessibilityDescription_(symbol, None)
+    if img is None:
+        return None
+    cfg_cls = getattr(AppKit, "NSImageSymbolConfiguration", None)
+    if cfg_cls is not None:
+        img = img.imageWithSymbolConfiguration_(
+            cfg_cls.configurationWithPointSize_weight_(float(_SF_POINTS), 0.0)
+        ) or img
+    img.setTemplate_(True)
+    sz = img.size()
+    sw, sh = (sz.width or _SF_POINTS), (sz.height or _SF_POINTS)
+    side = max(sw, sh)
+    px = int(round(side * _SF_SCALE))
+    rep = AppKit.NSBitmapImageRep.alloc().initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bitmapFormat_bytesPerRow_bitsPerPixel_(
+        None, px, px, 8, 4, True, False, AppKit.NSCalibratedRGBColorSpace, 0, 0, 0
+    )
+    rep.setSize_(NSSize(side, side))
+    ctx = AppKit.NSGraphicsContext.graphicsContextWithBitmapImageRep_(rep)
+    AppKit.NSGraphicsContext.saveGraphicsState()
+    AppKit.NSGraphicsContext.setCurrentContext_(ctx)
+    AppKit.NSColor.blackColor().set()
+    img.drawInRect_(NSMakeRect((side - sw) / 2, (side - sh) / 2, sw, sh))  # zentriert
+    AppKit.NSGraphicsContext.restoreGraphicsState()
+    png = rep.representationUsingType_properties_(AppKit.NSBitmapImageFileTypePNG, {})
+    if png is None:
+        return None
+    secure_dir(SUPPORT)
+    dest = SUPPORT / "menubar_template.png"
+    png.writeToFile_atomically_(str(dest), True)
+    return str(dest)
 
 
 # --------------------------------------------------------- Login-Autostart ---
@@ -351,6 +403,11 @@ class MailRelayApp(rumps.App):
         secure_dir(SUPPORT)
         secure_dir(SPOOL)
         self.log = setup_logging()
+        # Bevorzugt das SF-System-Symbol (gleiche Größe/Optik wie System-Icons);
+        # fällt still auf das gebündelte Outline-PNG zurück, wenn nicht verfügbar.
+        sf_icon = render_sf_menubar_icon()
+        if sf_icon:
+            self.icon = sf_icon
         self.cfg = load_config()
         save_config(self.cfg)
         self.controller = None
