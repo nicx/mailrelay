@@ -11,9 +11,11 @@ man stattdessen etwas Natives mit GUI direkt auf dem Mac möchte – ohne Docker
 
 ## Features
 
-- Menüleisten-App mit SF-System-Symbol (`envelope`) als Template – gleiche Größe
-  und Optik wie System-Icons, passt sich Hell/Dunkel an; Fallback auf ein
-  gebündeltes Outline-PNG. Kein Dock-Icon (`LSUIElement`)
+- Menüleisten-App mit SF-System-Symbol als Template (gleiche Optik wie System-
+  Icons, passt sich Hell/Dunkel an). Status am Icon ablesbar: **läuft = gefüllter
+  Umschlag** (`envelope.fill`), **gestoppt = Outline** (`envelope`) – analog zu
+  matter-server/homeassistant. Fallback: gebündeltes Outline-PNG (macOS < 11).
+  Kein Dock-Icon (`LSUIElement`)
 - SMTP-Listener auf konfigurierbarem Host/Port (Default `127.0.0.1:2525`)
 - Persistente Disk-Queue mit Retry und exponentiellem Backoff
 - Upstream mit STARTTLS (587), SSL (465) oder Plain (25)

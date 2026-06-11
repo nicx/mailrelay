@@ -106,7 +106,7 @@ def render_sf_menubar_icon(symbol="envelope"):
     if png is None:
         return None
     secure_dir(SUPPORT)
-    dest = SUPPORT / "menubar_template.png"
+    dest = SUPPORT / ("menubar_%s.png" % symbol.replace(".", "_"))
     png.writeToFile_atomically_(str(dest), True)
     return str(dest)
 
@@ -403,16 +403,13 @@ class MailRelayApp(rumps.App):
         secure_dir(SUPPORT)
         secure_dir(SPOOL)
         self.log = setup_logging()
-        # Bevorzugt das SF-System-Symbol (gleiche Größe/Optik wie System-Icons);
-        # fällt still auf das gebündelte Outline-PNG zurück, wenn nicht verfügbar.
-        sf_icon = render_sf_menubar_icon()
-        if sf_icon:
-            self.icon = sf_icon
         self.cfg = load_config()
         save_config(self.cfg)
         self.controller = None
         self.worker = None
         self.sent_count = 0
+        self._cur_symbol = None        # aktuell gesetztes Menüleisten-Symbol
+        self._icon_cache = {}          # Symbol -> gerenderter Template-PNG-Pfad
 
         self.status_item = rumps.MenuItem("Status: gestoppt")
         self.toggle_item = rumps.MenuItem("Start", callback=self.toggle)
@@ -454,6 +451,8 @@ class MailRelayApp(rumps.App):
             rumps.MenuItem("Beenden", callback=self.quit_app),
         ]
 
+        self.update_icon()    # Initialzustand (gestoppt -> Outline)
+
         # UI-Aktualisierung auf dem Main-Thread
         rumps.Timer(self.tick, 3).start()
 
@@ -476,6 +475,22 @@ class MailRelayApp(rumps.App):
             n = 0
         self.queue_item.title = f"Warteschlange: {n}"
         self.sent_item.title = f"Gesendet: {self.sent_count}"
+
+    # ----------------------------------------------------------- Menüleisten-Icon
+    def _icon_for(self, symbol):
+        """Gerendertes Template-PNG für ein SF-Symbol (gecacht); Fallback ICON."""
+        if symbol not in self._icon_cache:
+            self._icon_cache[symbol] = render_sf_menubar_icon(symbol) or ICON
+        return self._icon_cache[symbol]
+
+    def update_icon(self):
+        """Symbol nach Status: läuft = gefüllt (envelope.fill), gestoppt = Outline
+        (envelope) – analog zu matter-server / homeassistant."""
+        symbol = "envelope.fill" if self.controller else "envelope"
+        if symbol == self._cur_symbol:
+            return
+        self._cur_symbol = symbol
+        self.icon = self._icon_for(symbol)
 
     # ----------------------------------------------------------- Start/Stop
     def start_relay(self):
@@ -500,6 +515,7 @@ class MailRelayApp(rumps.App):
             f"Status: läuft ({self.cfg['listen_host']}:{self.cfg['listen_port']})"
         )
         self.toggle_item.title = "Stop"
+        self.update_icon()
         self.log.info("Relay gestartet auf %s:%s",
                       self.cfg["listen_host"], self.cfg["listen_port"])
 
@@ -525,6 +541,7 @@ class MailRelayApp(rumps.App):
             self.worker = None
         self.status_item.title = "Status: gestoppt"
         self.toggle_item.title = "Start"
+        self.update_icon()
         self.log.info("Relay gestoppt")
 
     def toggle(self, _):
