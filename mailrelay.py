@@ -55,26 +55,24 @@ def resource_path(name):
     return str(base / name)
 
 
-# Menüleisten-Symbol: bevorzugt das SF-System-Symbol „envelope" (gleiche Optik
-# und Größe wie System-Icons); als Fallback das gebündelte Outline-PNG.
-ICON = resource_path("menubar.png")
+# Menüleisten-Symbol: SF-System-Symbole als Vektor-Template (auflösungsfrei,
+# system-getönt für Hell/Dunkel). Drei Zustände -> drei Symbole:
+ICON = resource_path("menubar.png")   # gebündelter Fallback (macOS < 11)
+STATE_SYMBOLS = {
+    "stopped": "envelope",            # Relay gestoppt -> Outline
+    "running": "envelope.fill",       # Relay läuft     -> gefüllt
+    "error":   "envelope.badge",      # Zustellfehler   -> Umschlag mit Badge
+}
 
-# SF-Symbol bei 22 pt @2x – wie bei den Schwester-Apps (icloud-sync etc.)
-_SF_POINTS = 22
-_SF_SCALE = 2
+_SF_POINTS = 22                       # Punktgröße wie bei den Schwester-Apps
 
 
-def render_sf_menubar_icon(symbol="envelope"):
-    """Rendert das SF-Symbol als Template-PNG nach App Support und gibt den Pfad
-    zurück. None, wenn nicht möglich (z. B. macOS < 11) -> Fallback auf ICON.
-
-    Quadratischer Bitmap-Rep mit erhaltenem Seitenverhältnis, weil rumps das
-    Menüleisten-Icon auf 20x20 zwingt; ein nicht-quadratisches Bild würde sonst
-    gestaucht.
-    """
+def _sf_image(symbol):
+    """SF-Symbol als Template-NSImage (Vektor, 20 pt breit, Seitenverhältnis
+    erhalten) oder None (macOS < 11 / Symbol unbekannt)."""
     try:
         import AppKit
-        from Foundation import NSMakeRect, NSSize
+        from Foundation import NSSize
     except Exception:
         return None
     if not hasattr(AppKit.NSImage, "imageWithSystemSymbolName_accessibilityDescription_"):
@@ -87,28 +85,13 @@ def render_sf_menubar_icon(symbol="envelope"):
         img = img.imageWithSymbolConfiguration_(
             cfg_cls.configurationWithPointSize_weight_(float(_SF_POINTS), 0.0)
         ) or img
-    img.setTemplate_(True)
+    img.setTemplate_(True)            # macOS färbt es für Hell/Dunkel selbst
     sz = img.size()
     sw, sh = (sz.width or _SF_POINTS), (sz.height or _SF_POINTS)
-    side = max(sw, sh)
-    px = int(round(side * _SF_SCALE))
-    rep = AppKit.NSBitmapImageRep.alloc().initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bitmapFormat_bytesPerRow_bitsPerPixel_(
-        None, px, px, 8, 4, True, False, AppKit.NSCalibratedRGBColorSpace, 0, 0, 0
-    )
-    rep.setSize_(NSSize(side, side))
-    ctx = AppKit.NSGraphicsContext.graphicsContextWithBitmapImageRep_(rep)
-    AppKit.NSGraphicsContext.saveGraphicsState()
-    AppKit.NSGraphicsContext.setCurrentContext_(ctx)
-    AppKit.NSColor.blackColor().set()
-    img.drawInRect_(NSMakeRect((side - sw) / 2, (side - sh) / 2, sw, sh))  # zentriert
-    AppKit.NSGraphicsContext.restoreGraphicsState()
-    png = rep.representationUsingType_properties_(AppKit.NSBitmapImageFileTypePNG, {})
-    if png is None:
-        return None
-    secure_dir(SUPPORT)
-    dest = SUPPORT / "menubar_template.png"
-    png.writeToFile_atomically_(str(dest), True)
-    return str(dest)
+    # Auf 20 pt Breite normieren (gleiche Wirkgröße wie die anderen Apps),
+    # Höhe proportional -> keine Stauchung, da kein erzwungenes Quadrat.
+    img.setSize_(NSSize(20.0, 20.0 * sh / sw))
+    return img
 
 
 # --------------------------------------------------------- Login-Autostart ---
@@ -341,8 +324,10 @@ class RelayWorker(threading.Thread):
                 self.deliver(cfg, rec)
                 f.unlink(missing_ok=True)
                 self.app.sent_count += 1
+                self.app.last_delivery_error = False
                 self.app.log.info("Zugestellt: %s", f.name)
             except Exception as e:
+                self.app.last_delivery_error = True
                 rec["attempts"] = rec.get("attempts", 0) + 1
                 backoff = min(300, 5 * (2 ** rec["attempts"]))
                 rec["next_try"] = time.time() + backoff
@@ -403,16 +388,13 @@ class MailRelayApp(rumps.App):
         secure_dir(SUPPORT)
         secure_dir(SPOOL)
         self.log = setup_logging()
-        # Bevorzugt das SF-System-Symbol (gleiche Größe/Optik wie System-Icons);
-        # fällt still auf das gebündelte Outline-PNG zurück, wenn nicht verfügbar.
-        sf_icon = render_sf_menubar_icon()
-        if sf_icon:
-            self.icon = sf_icon
         self.cfg = load_config()
         save_config(self.cfg)
         self.controller = None
         self.worker = None
         self.sent_count = 0
+        self.last_delivery_error = False   # vom Worker gesetzt -> Fehler-Badge
+        self._icon_state = None            # zuletzt gesetzter Icon-Zustand
 
         self.status_item = rumps.MenuItem("Status: gestoppt")
         self.toggle_item = rumps.MenuItem("Start", callback=self.toggle)
@@ -454,6 +436,8 @@ class MailRelayApp(rumps.App):
             rumps.MenuItem("Beenden", callback=self.quit_app),
         ]
 
+        self.refresh_icon()   # Initialzustand (gestoppt -> Outline)
+
         # UI-Aktualisierung auf dem Main-Thread
         rumps.Timer(self.tick, 3).start()
 
@@ -476,6 +460,40 @@ class MailRelayApp(rumps.App):
             n = 0
         self.queue_item.title = f"Warteschlange: {n}"
         self.sent_item.title = f"Gesendet: {self.sent_count}"
+        self.refresh_icon()
+
+    # ----------------------------------------------------------- Menüleisten-Icon
+    def relay_state(self):
+        if not self.controller:
+            return "stopped"
+        if self.last_delivery_error:
+            return "error"
+        return "running"
+
+    def refresh_icon(self):
+        """Setzt das Menüleisten-Icon passend zum Zustand (Vektor-Template)."""
+        state = self.relay_state()
+        if state == self._icon_state:
+            return
+        self._icon_state = state
+        if not self._apply_symbol(STATE_SYMBOLS[state]):
+            # Fallback (z. B. macOS < 11): gebündeltes Outline-PNG als Template
+            self.template = True
+            self.icon = ICON
+
+    def _apply_symbol(self, symbol):
+        """Setzt ein SF-Symbol direkt als Vektor-Template auf die Statusleiste
+        (ohne PNG-Rastern). True bei Erfolg, sonst False."""
+        img = _sf_image(symbol)
+        if img is None:
+            return False
+        self._icon = symbol            # Marker != None (verhindert Name-Fallback)
+        self._icon_nsimage = img
+        try:
+            self._nsapp.setStatusBarIcon()
+        except AttributeError:
+            pass                       # vor run(): wird beim Start übernommen
+        return True
 
     # ----------------------------------------------------------- Start/Stop
     def start_relay(self):
@@ -489,6 +507,7 @@ class MailRelayApp(rumps.App):
                 port=int(self.cfg["listen_port"]),
             )
             self.controller.start()
+            self.last_delivery_error = False
             self.worker = RelayWorker(self)
             self.worker.start()
         except Exception as e:
@@ -500,6 +519,7 @@ class MailRelayApp(rumps.App):
             f"Status: läuft ({self.cfg['listen_host']}:{self.cfg['listen_port']})"
         )
         self.toggle_item.title = "Stop"
+        self.refresh_icon()
         self.log.info("Relay gestartet auf %s:%s",
                       self.cfg["listen_host"], self.cfg["listen_port"])
 
@@ -525,6 +545,7 @@ class MailRelayApp(rumps.App):
             self.worker = None
         self.status_item.title = "Status: gestoppt"
         self.toggle_item.title = "Start"
+        self.refresh_icon()
         self.log.info("Relay gestoppt")
 
     def toggle(self, _):
