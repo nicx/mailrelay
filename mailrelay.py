@@ -177,6 +177,20 @@ def set_login_item(enabled):
 PF_LABEL = "com.github.mailrelay.pf"
 PF_DAEMON = Path("/Library/LaunchDaemons") / f"{PF_LABEL}.plist"
 PF_ANCHOR = Path("/etc/pf.anchors/mailrelay")
+PF_CONF = Path("/etc/pf.conf")
+PF_ANCHOR_NAME = "mailrelay"
+_RDR_ANCHOR_LINE = f'rdr-anchor "{PF_ANCHOR_NAME}"'
+_LOAD_ANCHOR_LINE = f'load anchor "{PF_ANCHOR_NAME}" from "{PF_ANCHOR}"'
+
+# Fallback, falls /etc/pf.conf fehlt (entspricht Apples Default).
+_DEFAULT_PF_CONF = (
+    'scrub-anchor "com.apple/*"\n'
+    'nat-anchor "com.apple/*"\n'
+    'rdr-anchor "com.apple/*"\n'
+    'dummynet-anchor "com.apple/*"\n'
+    'anchor "com.apple/*"\n'
+    'load anchor "com.apple" from "/etc/pf.anchors/com.apple"\n'
+)
 
 
 def port25_redirect_enabled():
@@ -195,53 +209,98 @@ def _run_with_admin(shell_cmd):
         raise RuntimeError((r.stderr or "").strip() or "abgebrochen")
 
 
-def _pf_ruleset(target_port):
-    """Vollständiges pf-Regelwerk: Apple-Anker erhalten + unsere rdr-Regel."""
-    return (
-        'scrub-anchor "com.apple/*"\n'
-        'nat-anchor "com.apple/*"\n'
-        'rdr-anchor "com.apple/*"\n'
-        f"rdr pass inet proto tcp from any to any port 25 -> 127.0.0.1 port {int(target_port)}\n"
-        'dummynet-anchor "com.apple/*"\n'
-        'anchor "com.apple/*"\n'
-        'load anchor "com.apple/*" from "/etc/pf.anchors/com.apple"\n'
+def _current_pf_conf():
+    try:
+        return PF_CONF.read_text()
+    except OSError:
+        return _DEFAULT_PF_CONF
+
+
+def _last_index_with_prefix(lines, prefix):
+    found = None
+    for i, line in enumerate(lines):
+        if line.strip().startswith(prefix):
+            found = i
+    return found
+
+
+def _conf_by_adding_anchor(original):
+    """Registriert unseren benannten Anker idempotent im Haupt-Regelwerk und
+    erhält dabei andere Anker (z. B. den von ProxyManager) — so kommen sich
+    mehrere pf-nutzende Apps nicht in die Quere."""
+    lines = original.split("\n")
+    while lines and lines[-1].strip() == "":
+        lines.pop()
+    if _RDR_ANCHOR_LINE not in lines:
+        # rdr-anchor gehört in den Translation-Abschnitt, vor die Filter-Anker.
+        idx = _last_index_with_prefix(lines, "rdr-anchor")
+        if idx is None:
+            idx = _last_index_with_prefix(lines, "nat-anchor")
+        if idx is None:
+            idx = _last_index_with_prefix(lines, "scrub-anchor")
+        if idx is None:
+            lines.insert(0, _RDR_ANCHOR_LINE)
+        else:
+            lines.insert(idx + 1, _RDR_ANCHOR_LINE)
+    if _LOAD_ANCHOR_LINE not in lines:
+        lines.append(_LOAD_ANCHOR_LINE)
+    return "\n".join(lines) + "\n"
+
+
+def _conf_by_removing_anchor(original):
+    return "\n".join(
+        line for line in original.split("\n")
+        if line != _RDR_ANCHOR_LINE and line != _LOAD_ANCHOR_LINE
     )
+
+
+def _anchor_rule(target_port):
+    """Reiner Anker-Inhalt (nur die rdr-Regel) — kein Voll-Regelwerk."""
+    return f"rdr pass inet proto tcp from any to any port 25 -> 127.0.0.1 port {int(target_port)}\n"
 
 
 def set_port25_redirect(enabled, target_port):
     """pf-Weiterleitung 25 -> 127.0.0.1:target_port als LaunchDaemon ein-/ausschalten.
-    Erfordert einmalig Admin-Rechte."""
+    Erfordert einmalig Admin-Rechte. Koexistenz-Modell: trägt einen benannten
+    Anker in /etc/pf.conf ein und lädt diese gemeinsame Datei, statt das gesamte
+    Regelwerk zu ersetzen (so bleiben Anker anderer Apps aktiv)."""
     daemon = f"'{PF_DAEMON}'"
     anchor = str(PF_ANCHOR)
+    secure_dir(SUPPORT)
+    tmp_conf = SUPPORT / "pf-conf.tmp"
     if enabled:
-        secure_dir(SUPPORT)
         tmp_anchor = SUPPORT / "pf-anchor.tmp"
         tmp_plist = SUPPORT / "pf-daemon.tmp"
-        tmp_anchor.write_text(_pf_ruleset(target_port))
+        tmp_anchor.write_text(_anchor_rule(target_port))
+        tmp_conf.write_text(_conf_by_adding_anchor(_current_pf_conf()))
         with open(tmp_plist, "wb") as f:
             plistlib.dump(
                 {
                     "Label": PF_LABEL,
-                    "ProgramArguments": ["/sbin/pfctl", "-E", "-f", anchor],
+                    "ProgramArguments": ["/sbin/pfctl", "-E", "-f", "/etc/pf.conf"],
                     "RunAtLoad": True,
                 },
                 f,
             )
         cmd = (
-            f"/sbin/pfctl -nf '{tmp_anchor}' && "                  # Regelwerk validieren
             f"mkdir -p /etc/pf.anchors && "
             f"cp '{tmp_anchor}' {anchor} && chown root:wheel {anchor} && chmod 644 {anchor} && "
+            f"(cp -n /etc/pf.conf /etc/pf.conf.orig.mailrelay 2>/dev/null || true) && "
+            f"/sbin/pfctl -nf '{tmp_conf}' && "                    # Regelwerk validieren
+            f"cp '{tmp_conf}' /etc/pf.conf && chown root:wheel /etc/pf.conf && chmod 644 /etc/pf.conf && "
             f"cp '{tmp_plist}' {daemon} && chown root:wheel {daemon} && chmod 644 {daemon} && "
             f"(launchctl bootout system {daemon} 2>/dev/null || true) && "
             f"launchctl bootstrap system {daemon} && "
-            f"/sbin/pfctl -E -f {anchor}"
+            f"/sbin/pfctl -E -f /etc/pf.conf"
         )
         _run_with_admin(cmd)
     else:
+        tmp_conf.write_text(_conf_by_removing_anchor(_current_pf_conf()))
         cmd = (
             f"(launchctl bootout system {daemon} 2>/dev/null || true); "
             f"rm -f {daemon} {anchor}; "
-            f"/sbin/pfctl -f /etc/pf.conf 2>/dev/null; true"
+            f"cp '{tmp_conf}' /etc/pf.conf && chown root:wheel /etc/pf.conf && chmod 644 /etc/pf.conf; "
+            f"/sbin/pfctl -E -f /etc/pf.conf 2>/dev/null; true"
         )
         _run_with_admin(cmd)
 

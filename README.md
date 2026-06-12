@@ -72,33 +72,45 @@ Weg: Die App bleibt auf dem unprivilegierten Port **2525**, und macOS leitet
 eingehenden Verkehr von Port 25 dorthin um – über die eingebaute Firewall `pf`.
 
 **Am einfachsten direkt in der App:** **Einstellungen → „Port 25 weiterleiten
-(25 → 2525)"** aktivieren. Das installiert die pf-Regel **und** einen
-LaunchDaemon (über Neustarts persistent) nach einmaliger Eingabe des
-Admin-Passworts (macOS-Dialog) und entfernt beides beim Deaktivieren wieder.
-Das Regelwerk behält die Apple-Standardanker bei. Die folgenden Schritte sind
-nur nötig, wenn du es **manuell** ohne die App einrichten willst.
+(25 → 2525)"** aktivieren. Das legt einen **benannten pf-Anker** an und trägt
+ihn in das System-Regelwerk `/etc/pf.conf` ein, lädt dieses und installiert
+einen LaunchDaemon (über Neustarts persistent) – nach einmaliger Eingabe des
+Admin-Passworts (macOS-Dialog); beim Deaktivieren wird alles wieder entfernt.
+Weil nur ein **benannter Anker** ergänzt wird (statt das ganze Regelwerk zu
+ersetzen), **koexistiert die Regel mit anderen pf-nutzenden Apps** (z. B.
+ProxyManager auf 80/443). Die folgenden Schritte sind nur nötig, wenn du es
+**manuell** ohne die App einrichten willst.
 
 **1. App-Einstellungen** (Menü → Einstellungen):
 
 - Listen-Port: `2525` (**nicht** `25`)
 - Listen-Host: `0.0.0.0`, damit andere Geräte im LAN senden können
 
-**2. Umleitungsregel anlegen** – Datei `/etc/pf.anchors/mailrelay`:
+**2. Anker anlegen** – Datei `/etc/pf.anchors/mailrelay` (nur die rdr-Regel):
 
 ```
 rdr pass inet proto tcp from any to any port 25 -> 127.0.0.1 port 2525
 ```
 
-**3. Regel laden** (einmalig `sudo`, da Systemeingriff):
+**3. Anker in `/etc/pf.conf` referenzieren** (im Translation-Abschnitt bzw. am
+Ende, damit Apples Anker erhalten bleiben):
 
-```bash
-sudo pfctl -ef /etc/pf.anchors/mailrelay   # pf aktivieren + Regel laden
-sudo pfctl -sn                             # Kontrolle: rdr-Regel sichtbar?
+```
+rdr-anchor "mailrelay"
+load anchor "mailrelay" from "/etc/pf.anchors/mailrelay"
 ```
 
-**4. Persistent über Neustarts** (optional): Ein **LaunchDaemon** unter
-`/Library/LaunchDaemons/` lädt die Regel beim Boot als root erneut
-(`pfctl -ef /etc/pf.anchors/mailrelay`) – sonst ist sie nach einem Reboot weg.
+**4. Gemeinsames Regelwerk laden** (einmalig `sudo`):
+
+```bash
+sudo pfctl -E -f /etc/pf.conf   # pf aktivieren + /etc/pf.conf laden
+sudo pfctl -sn                  # Kontrolle: rdr-Regel sichtbar?
+```
+
+**5. Persistent über Neustarts** (optional): Ein **LaunchDaemon** unter
+`/Library/LaunchDaemons/` lädt beim Boot erneut `pfctl -E -f /etc/pf.conf` –
+sonst ist die Regel nach einem Reboot weg. Mehrere Apps, die ihren Anker in
+`/etc/pf.conf` eintragen, bleiben so gleichzeitig aktiv.
 
 ### Stolpersteine
 
