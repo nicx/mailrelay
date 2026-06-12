@@ -49,7 +49,11 @@ def resource_path(name):
     py2app-.app (dort liegen Ressourcen unter Contents/Resources/<name>).
     """
     if getattr(sys, "frozen", False):
-        base = Path(sys.executable).resolve().parent.parent / "Resources"
+        # py2app setzt RESOURCEPATH auf Contents/Resources. Wichtig v. a. beim
+        # Alias-Build, wo sys.executable auf den (Homebrew-)Python-Interpreter
+        # zeigt statt ins Bundle – die Pfadberechnung wäre dann falsch.
+        res = os.environ.get("RESOURCEPATH")
+        base = Path(res) if res else Path(sys.executable).resolve().parent.parent / "Resources"
     else:
         base = Path(__file__).resolve().parent / "assets"
     return str(base / name)
@@ -120,7 +124,12 @@ LOGIN_PLIST = LAUNCH_AGENTS / f"{LOGIN_LABEL}.plist"
 def app_bundle_path():
     """Pfad zur .app, wenn aus dem Bundle gestartet; sonst None (Quelltext)."""
     if getattr(sys, "frozen", False):
-        # …/MailRelay.app/Contents/MacOS/<exe> -> parents[2] = …/MailRelay.app
+        # Bevorzugt aus RESOURCEPATH ableiten (…/MailRelay.app/Contents/Resources
+        # -> .app), da sys.executable im Alias-Build auf den Python-Interpreter
+        # zeigt statt ins Bundle.
+        res = os.environ.get("RESOURCEPATH")
+        if res:
+            return Path(res).resolve().parent.parent
         return Path(sys.executable).resolve().parents[2]
     return None
 
