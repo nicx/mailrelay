@@ -71,6 +71,13 @@ nicht direkt belegen (Start scheitert mit „Start fehlgeschlagen“). Der saube
 Weg: Die App bleibt auf dem unprivilegierten Port **2525**, und macOS leitet
 eingehenden Verkehr von Port 25 dorthin um – über die eingebaute Firewall `pf`.
 
+**Am einfachsten direkt in der App:** **Einstellungen → „Port 25 weiterleiten
+(25 → 2525)"** aktivieren. Das installiert die pf-Regel **und** einen
+LaunchDaemon (über Neustarts persistent) nach einmaliger Eingabe des
+Admin-Passworts (macOS-Dialog) und entfernt beides beim Deaktivieren wieder.
+Das Regelwerk behält die Apple-Standardanker bei. Die folgenden Schritte sind
+nur nötig, wenn du es **manuell** ohne die App einrichten willst.
+
 **1. App-Einstellungen** (Menü → Einstellungen):
 
 - Listen-Port: `2525` (**nicht** `25`)

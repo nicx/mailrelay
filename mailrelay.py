@@ -169,6 +169,83 @@ def set_login_item(enabled):
             LOGIN_PLIST.unlink(missing_ok=True)
 
 
+# -------------------------------------------------- Port-25-Weiterleitung (pf) ---
+# Port 25 ist privilegiert (Root). Statt die App als Root laufen zu lassen, leitet
+# macOS' Paketfilter pf eingehend 25 -> 127.0.0.1:<listen_port> um. Ein LaunchDaemon
+# macht die Regel über Neustarts persistent. Installation/Entfernung erfordert
+# einmalig Admin-Rechte (macOS-Auth-Dialog via osascript).
+PF_LABEL = "com.github.mailrelay.pf"
+PF_DAEMON = Path("/Library/LaunchDaemons") / f"{PF_LABEL}.plist"
+PF_ANCHOR = Path("/etc/pf.anchors/mailrelay")
+
+
+def port25_redirect_enabled():
+    """True, wenn der pf-LaunchDaemon für die Port-25-Weiterleitung installiert ist."""
+    return PF_DAEMON.exists()
+
+
+def _run_with_admin(shell_cmd):
+    """Führt shell_cmd mit Admin-Rechten aus (macOS-Auth-Dialog). RuntimeError bei
+    Abbruch/Fehler (z. B. Passwort-Dialog abgebrochen)."""
+    apple = 'do shell script "%s" with administrator privileges' % (
+        shell_cmd.replace("\\", "\\\\").replace('"', '\\"')
+    )
+    r = subprocess.run(["osascript", "-e", apple], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or "").strip() or "abgebrochen")
+
+
+def _pf_ruleset(target_port):
+    """Vollständiges pf-Regelwerk: Apple-Anker erhalten + unsere rdr-Regel."""
+    return (
+        'scrub-anchor "com.apple/*"\n'
+        'nat-anchor "com.apple/*"\n'
+        'rdr-anchor "com.apple/*"\n'
+        f"rdr pass inet proto tcp from any to any port 25 -> 127.0.0.1 port {int(target_port)}\n"
+        'dummynet-anchor "com.apple/*"\n'
+        'anchor "com.apple/*"\n'
+        'load anchor "com.apple/*" from "/etc/pf.anchors/com.apple"\n'
+    )
+
+
+def set_port25_redirect(enabled, target_port):
+    """pf-Weiterleitung 25 -> 127.0.0.1:target_port als LaunchDaemon ein-/ausschalten.
+    Erfordert einmalig Admin-Rechte."""
+    daemon = f"'{PF_DAEMON}'"
+    anchor = str(PF_ANCHOR)
+    if enabled:
+        secure_dir(SUPPORT)
+        tmp_anchor = SUPPORT / "pf-anchor.tmp"
+        tmp_plist = SUPPORT / "pf-daemon.tmp"
+        tmp_anchor.write_text(_pf_ruleset(target_port))
+        with open(tmp_plist, "wb") as f:
+            plistlib.dump(
+                {
+                    "Label": PF_LABEL,
+                    "ProgramArguments": ["/sbin/pfctl", "-E", "-f", anchor],
+                    "RunAtLoad": True,
+                },
+                f,
+            )
+        cmd = (
+            f"/sbin/pfctl -nf '{tmp_anchor}' && "                  # Regelwerk validieren
+            f"mkdir -p /etc/pf.anchors && "
+            f"cp '{tmp_anchor}' {anchor} && chown root:wheel {anchor} && chmod 644 {anchor} && "
+            f"cp '{tmp_plist}' {daemon} && chown root:wheel {daemon} && chmod 644 {daemon} && "
+            f"(launchctl bootout system {daemon} 2>/dev/null || true) && "
+            f"launchctl bootstrap system {daemon} && "
+            f"/sbin/pfctl -E -f {anchor}"
+        )
+        _run_with_admin(cmd)
+    else:
+        cmd = (
+            f"(launchctl bootout system {daemon} 2>/dev/null || true); "
+            f"rm -f {daemon} {anchor}; "
+            f"/sbin/pfctl -f /etc/pf.conf 2>/dev/null; true"
+        )
+        _run_with_admin(cmd)
+
+
 DEFAULTS = {
     "listen_host": "127.0.0.1",   # auf 0.0.0.0 setzen, wenn andere LAN-Geräte relayen sollen
     "listen_port": 2525,          # Port 25 bräuchte root -> lieber Client umstellen oder pf-Redirect
@@ -431,6 +508,12 @@ class MailRelayApp(rumps.App):
         self.login_item = rumps.MenuItem("Beim Login starten", callback=self.toggle_login_item)
         self.login_item.state = 1 if login_item_enabled() else 0
 
+        self.pf_item = rumps.MenuItem(
+            "Port 25 weiterleiten (25 → %s)" % self.cfg.get("listen_port", 2525),
+            callback=self.toggle_port25,
+        )
+        self.pf_item.state = 1 if port25_redirect_enabled() else 0
+
         settings = rumps.MenuItem("Einstellungen")
         settings.update([
             rumps.MenuItem("Listen-Host…", callback=self.set_listen_host),
@@ -444,6 +527,7 @@ class MailRelayApp(rumps.App):
             self.tls_item,
             None,
             self.login_item,
+            self.pf_item,
             rumps.MenuItem("Konfigurationsdatei öffnen…", callback=self.open_config),
         ])
 
@@ -647,6 +731,25 @@ class MailRelayApp(rumps.App):
             return
         sender.state = 1 if want else 0
         self.log.info("Login-Autostart: %s", "ein" if want else "aus")
+
+    def toggle_port25(self, sender):
+        want = not bool(sender.state)
+        port = self.cfg.get("listen_port", 2525)
+        if want and int(port) == 25:
+            rumps.alert(APP_NAME, "Listen-Port ist bereits 25 – eine Umleitung ergibt keinen Sinn.")
+            return
+        try:
+            set_port25_redirect(want, port)
+        except Exception as e:
+            rumps.alert(APP_NAME, f"Port-25-Weiterleitung konnte nicht geändert werden:\n{e}")
+            return
+        sender.state = 1 if want else 0
+        self.log.info("Port-25-Weiterleitung: %s (-> %s)", "ein" if want else "aus", port)
+        rumps.notification(
+            APP_NAME, "",
+            f"Port-25-Weiterleitung aktiv: 25 → {port}." if want
+            else "Port-25-Weiterleitung deaktiviert.",
+        )
 
     # ----------------------------------------------------------- Aktionen
     def flush_now(self, _):
