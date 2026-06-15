@@ -321,6 +321,10 @@ LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
 MAX_QUEUE_FILES = 10000           # DoS-Schutz: Obergrenze der Warteschlange (M3)
 DIR_MODE = 0o700                  # Verzeichnisrechte: nur Eigentümer (M1)
 FILE_MODE = 0o600                 # Dateirechte: nur Eigentümer (M1)
+# aiosmtpd-Default ist 1 s; beim Autostart direkt nach Login/Reboot ist das
+# System unter Last und der Server-Thread meldet „ready" oft nicht rechtzeitig
+# (-> „SMTP server started, but not responding within allotted time"). Großzügig.
+READY_TIMEOUT = 15.0
 
 
 # ---------------------------------------------------- Datei-/Verzeichnisrechte ---
@@ -654,6 +658,7 @@ class MailRelayApp(rumps.App):
                 handler,
                 hostname=self.cfg["listen_host"],
                 port=int(self.cfg["listen_port"]),
+                ready_timeout=READY_TIMEOUT,
             )
             self.controller.start()
             self.worker = RelayWorker(self)
