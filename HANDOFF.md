@@ -35,6 +35,12 @@ make run PYTHON=/opt/homebrew/bin/python3.13          # aus Quelltext testen
   lädt. ⚠️ **NICHT** auf ein privates Voll-Regelwerk (`pfctl -f privat.conf`)
   zurückfallen — sonst werden Anker anderer Apps (z. B. ProxyManager 80/443)
   beim Boot weggespült. Siehe Commit `cd3020a`.
+- **Listen-Host `0.0.0.0`/`::` -> Controller bekommt `""`:** aiosmtpd testet nach
+  dem Bind eine Verbindung gegen `self.hostname`; `0.0.0.0` ist als *Verbindungs-
+  ziel* (macOS) nicht erreichbar -> Start scheitert mit „SMTP server started, but
+  not responding within allotted time", obwohl der Bind klappte. `start_relay`
+  übersetzt `0.0.0.0`/`::` daher in `""` (bindet ebenso alle Interfaces, Selbst-
+  test läuft gegen localhost). Zusätzlich `READY_TIMEOUT=15` als Last-Sicherheitsnetz.
 - **Sicherheit:** AUTH nur über TLS; optionale Absender-Allowlist (IP/CIDR) gegen
   offenes Relay (+ Warnung bei nicht-lokalem Bind ohne Allowlist); Queue/Log/
   Config mit `0600`/`0700`; Queue-Obergrenze `MAX_QUEUE_FILES`.

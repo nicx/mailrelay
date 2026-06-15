@@ -654,9 +654,16 @@ class MailRelayApp(rumps.App):
             return
         try:
             handler = RelayHandler(self)
+            # aiosmtpd testet nach dem Bind eine Verbindung gegen self.hostname.
+            # "0.0.0.0"/"::" sind als *Verbindungsziel* (macOS) nicht erreichbar
+            # -> der Selbsttest scheitert mit „not responding within allotted
+            # time", obwohl der Bind klappte. Leerer Hostname bindet ebenfalls
+            # alle Interfaces, lässt aiosmtpd aber gegen localhost testen.
+            listen_host = self.cfg["listen_host"]
+            controller_host = "" if listen_host in ("0.0.0.0", "::") else listen_host
             self.controller = Controller(
                 handler,
-                hostname=self.cfg["listen_host"],
+                hostname=controller_host,
                 port=int(self.cfg["listen_port"]),
                 ready_timeout=READY_TIMEOUT,
             )
