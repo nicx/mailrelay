@@ -41,6 +41,12 @@ make run PYTHON=/opt/homebrew/bin/python3.13          # aus Quelltext testen
   not responding within allotted time", obwohl der Bind klappte. `start_relay`
   übersetzt `0.0.0.0`/`::` daher in `""` (bindet ebenso alle Interfaces, Selbst-
   test läuft gegen localhost). Zusätzlich `READY_TIMEOUT=15` als Last-Sicherheitsnetz.
+- **Absender erzwingen (`force_sender`):** Optionaler Sender-Rewrite. Ist gesetzt,
+  schreibt `deliver()` Envelope-`MAIL FROM` **und** den `From:`-Header auf den Wert
+  um (Originalabsender bleibt als `Reply-To`). `rewrite_from()` arbeitet **header-
+  only** und lässt den Body byte-genau (PDF-Anhänge!) – NICHT auf
+  `email…as_bytes()` der ganzen Message umstellen, das verändert den Body. Use-Case:
+  HP-Scan-to-Mail setzt die Empfängeradresse als Absender -> iCloud-`550`.
 - **Sicherheit:** AUTH nur über TLS; optionale Absender-Allowlist (IP/CIDR) gegen
   offenes Relay (+ Warnung bei nicht-lokalem Bind ohne Allowlist); Queue/Log/
   Config mit `0600`/`0700`; Queue-Obergrenze `MAX_QUEUE_FILES`.

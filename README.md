@@ -62,6 +62,13 @@ Queue/Log: gleiches Verzeichnis (`spool/`, `failed/`, `mailrelay.log`).
 
 - Sollen andere Geräte im LAN relayen, Listen-Host auf `0.0.0.0` setzen
   (statt `127.0.0.1`, das nur lokale Verbindungen annimmt).
+- **Absender erzwingen** (Einstellungen → „Absender erzwingen…"): Manche Quellen
+  setzen einen Absender, den der Upstream ablehnt – z. B. HP-Scan-to-Mail
+  (OfficeJet) nutzt die *Empfänger*adresse als Absender, woraufhin iCloud mit
+  `550 From address is not one of your addresses` ablehnt. Trägt man hier die
+  Upstream-Account-Adresse ein, schreibt MailRelay vor dem Senden den
+  Envelope-`MAIL FROM` **und** den `From:`-Header darauf um; der ursprüngliche
+  Absender bleibt als `Reply-To` erhalten. Leer = aus.
 
 ## Port 25 nutzen (pf-Umleitung)
 

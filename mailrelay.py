@@ -312,6 +312,7 @@ DEFAULTS = {
     "upstream_port": 587,
     "username": "",
     "use_starttls": True,
+    "force_sender": "",           # gesetzt = Envelope-MAIL-FROM + From:-Header darauf umschreiben
     "max_retries": 10,
     "allowed_peers": [],          # leer = alle erlaubt; sonst Allowlist aus IPs/CIDR (H1)
 }
@@ -460,6 +461,58 @@ class RelayHandler:
         return "250 Message accepted for delivery"
 
 
+# ----------------------------------------------------------- Sender-Rewrite ---
+def rewrite_from(data, new_sender):
+    """Schreibt den `From:`-Header der Mail auf `new_sender` um und hängt den
+    Originalabsender als `Reply-To` an (falls noch keiner gesetzt ist), damit
+    Antworten weiterhin den ursprünglichen Absender erreichen.
+
+    Nötig für Quellen, die einen Absender setzen, den der Upstream nicht
+    akzeptiert (z. B. HP-Scan-to-Mail nutzt die Empfängeradresse als Absender,
+    iCloud lehnt das mit „550 From address is not one of your addresses" ab).
+
+    Bearbeitet ausschließlich den Header-Block; der Body (z. B. ein PDF-Anhang)
+    bleibt byte-genau erhalten. Faltzeilen (RFC 5322 folding) werden respektiert.
+    """
+    new_sender = new_sender.replace("\r", "").replace("\n", "").strip()
+
+    # Header/Body byte-genau trennen – Body wird unverändert wieder angehängt.
+    for sep in (b"\r\n\r\n", b"\n\n"):
+        idx = data.find(sep)
+        if idx >= 0:
+            head_bytes, body, sep_used = data[:idx], data[idx + len(sep):], sep
+            break
+    else:
+        head_bytes, body, sep_used = data, b"", b"\r\n\r\n"
+
+    eol = "\r\n" if b"\r\n" in head_bytes else "\n"
+    # Header-Felder rekonstruieren (eine Faltzeile beginnt mit Space/Tab).
+    fields = []
+    for line in head_bytes.decode("latin-1").split(eol):
+        if line[:1] in (" ", "\t") and fields:
+            fields[-1].append(line)
+        else:
+            fields.append([line])
+
+    def fname(field):
+        return field[0].split(":", 1)[0].strip().lower() if ":" in field[0] else ""
+
+    orig_from = next((eol.join(f) for f in fields if fname(f) == "from"), None)
+    has_reply_to = any(fname(f) == "reply-to" for f in fields)
+
+    out = []
+    for f in fields:
+        if fname(f) == "from":
+            out.append("From: " + new_sender)
+        else:
+            out.extend(f)
+    if orig_from and not has_reply_to:
+        # Originalabsender als Reply-To erhalten (Wert nach dem ersten Doppelpunkt).
+        out.append("Reply-To:" + orig_from.split(":", 1)[1])
+
+    return eol.join(out).encode("latin-1") + sep_used + body
+
+
 # ---------------------------------------------------- Zustellung / Worker ---
 class RelayWorker(threading.Thread):
     """Liest die Queue und stellt an den Upstream zu, mit Retry/Backoff."""
@@ -516,6 +569,15 @@ class RelayWorker(threading.Thread):
             raise RuntimeError("kein Upstream-Host konfiguriert")
         data = base64.b64decode(rec["data"])
 
+        # Optional: Absender erzwingen (Envelope-MAIL-FROM + From:-Header), damit
+        # Quellen mit „falschem" Absender (HP-Scan-to-Mail, Skripte) vom Upstream
+        # akzeptiert werden. Greift für vorhandene wie neue Queue-Einträge.
+        force = (cfg.get("force_sender") or "").strip()
+        mailfrom = rec["mailfrom"]
+        if force:
+            mailfrom = force
+            data = rewrite_from(data, force)
+
         secure = False
         if port == 465:
             s = smtplib.SMTP_SSL(host, port, timeout=30,
@@ -537,7 +599,7 @@ class RelayWorker(threading.Thread):
                         "AUTH nur über TLS erlaubt – STARTTLS aktivieren oder Port 465 nutzen"
                     )
                 s.login(user, keychain_get(user))
-            s.sendmail(rec["mailfrom"], rec["rcpttos"], data)
+            s.sendmail(mailfrom, rec["rcpttos"], data)
         finally:
             try:
                 s.quit()
@@ -587,6 +649,7 @@ class MailRelayApp(rumps.App):
             rumps.MenuItem("Upstream-Port…", callback=self.set_upstream_port),
             rumps.MenuItem("Benutzername…", callback=self.set_username),
             rumps.MenuItem("Passwort…", callback=self.set_password),
+            rumps.MenuItem("Absender erzwingen…", callback=self.set_force_sender),
             self.tls_item,
             None,
             self.login_item,
@@ -787,6 +850,18 @@ class MailRelayApp(rumps.App):
         if v is not None:
             keychain_set(user, v)
             rumps.notification(APP_NAME, "", "Passwort im Schlüsselbund gespeichert.")
+
+    def set_force_sender(self, _):
+        cur = self.cfg.get("force_sender", "") or self.cfg.get("username", "")
+        v = self.prompt(
+            "Absender erzwingen (Envelope + From:-Header darauf umschreiben).\n"
+            "Leer lassen = aus. Sinnvoll = die Upstream-Account-Adresse, z. B.\n"
+            "wenn der Drucker/Skript einen vom Upstream abgelehnten Absender setzt:",
+            cur,
+        )
+        if v is not None:
+            self.cfg["force_sender"] = v.strip()
+            save_config(self.cfg)
 
     def toggle_tls(self, sender):
         sender.state = 0 if sender.state else 1
