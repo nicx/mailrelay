@@ -29,6 +29,7 @@ import subprocess
 from pathlib import Path
 
 import rumps
+import keyring
 from aiosmtpd.controller import Controller
 
 __version__ = "1.0.0"
@@ -374,28 +375,23 @@ def queue_count():
 
 
 # ---------------------------------------------------------------- Keychain ---
+# Über die `keyring`-Library (Security-Framework) statt des `security`-CLI: so steht
+# das Passwort nie als Prozessargument in der Kommandozeile (früher via `ps` kurz
+# sichtbar – Security-Finding M2). Gleicher Ansatz wie die Schwester-Apps.
 def keychain_set(account, password):
     if not account:
         return
-    subprocess.run(
-        ["security", "delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account],
-        capture_output=True,
-    )
-    subprocess.run(
-        ["security", "add-generic-password", "-s", KEYCHAIN_SERVICE,
-         "-a", account, "-w", password],
-        capture_output=True,
-    )
+    keyring.set_password(KEYCHAIN_SERVICE, account, password)
 
 
 def keychain_get(account):
     if not account:
         return ""
-    r = subprocess.run(
-        ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account, "-w"],
-        capture_output=True, text=True,
-    )
-    return r.stdout.strip() if r.returncode == 0 else ""
+    try:
+        return keyring.get_password(KEYCHAIN_SERVICE, account) or ""
+    except Exception:
+        # Läuft auch im Worker-Thread bei jeder Zustellung – nie hart fehlschlagen.
+        return ""
 
 
 # ------------------------------------------------------------------ Config ---
@@ -1013,7 +1009,10 @@ class MailRelayApp(rumps.App):
         pw = raw.get("password") or ""
         if pw:
             if values["username"]:
-                keychain_set(values["username"], pw)
+                try:
+                    keychain_set(values["username"], pw)
+                except Exception as e:
+                    self._settings_notices.append(f"Passwort nicht gespeichert:\n{e}")
             else:
                 self._settings_notices.append(
                     "Passwort ignoriert – es ist kein Benutzername gesetzt.")

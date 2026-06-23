@@ -14,7 +14,7 @@ DATA_FILES = []
 OPTIONS = {
     "argv_emulation": False,
     "iconfile": "assets/icon.icns",
-    "packages": ["rumps", "aiosmtpd"],
+    "packages": ["rumps", "aiosmtpd", "keyring"],
     # Menüleisten-Template-Icon landet in Contents/Resources/
     "resources": ["assets/menubar.png"],
     "plist": {

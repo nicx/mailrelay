@@ -64,8 +64,7 @@ vereinheitlichen, rumps mittelfristig ablösen (eine Sprache, ein Repo, Tests bl
 kein IPC). Der aktuelle Dual-Style (rumps-Menü + PyObjC-Fenster) ist Übergang. Erledigt:
 Settings-Fenster (Baustein 1). Offen: gemeinsames `menubar-ui`-Modul extrahieren +
 icloud-sync/evcc darauf umstellen; dann `NSAlert`-Helfer, `NSStatusItem`+`NSMenu`,
-`NSTimer`, Notifications, eigene Runloop → rumps raus. Keychain dann über das
-Security-Framework statt `security`-CLI (löst M2).
+`NSTimer`, Notifications, eigene Runloop → rumps raus.
 
 ## Was NICHT im Repo liegt (pro-Mac neu einrichten)
 - Laufzeit-Config `~/Library/Application Support/MailRelay/config.json`
@@ -75,8 +74,9 @@ Security-Framework statt `security`-CLI (löst M2).
 ## Offene/optionale Punkte
 - Code-Signing + Notarisierung (Developer-ID) gegen Gatekeeper – noch offen.
 - Optionaler GitHub-Actions-Release-Workflow (macOS-Runner, App bei Tag bauen).
-- Security-Finding M2 (Keychain-Passwort als `security`-CLI-Argument kurz via
-  `ps` sichtbar) – bewusst offen; Umstellung auf Security-Framework-API möglich.
+- ~~Security-Finding M2 (Keychain-Passwort via `security`-CLI in `ps` sichtbar)~~ –
+  **erledigt:** Keychain läuft jetzt über die `keyring`-Library (Security-Framework),
+  kein Passwort mehr in der Prozess-Argumentliste.
 
 ## Git-Identität / Account
 Repo unter GitHub-Account **nicx** (`https://github.com/nicx/mailrelay`).
