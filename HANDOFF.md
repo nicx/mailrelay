@@ -51,6 +51,21 @@ make run PYTHON=/opt/homebrew/bin/python3.13          # aus Quelltext testen
   offenes Relay (+ Warnung bei nicht-lokalem Bind ohne Allowlist); Queue/Log/
   Config mit `0600`/`0700`; Queue-Obergrenze `MAX_QUEUE_FILES`.
 - **Login-Autostart** über LaunchAgent (`open -a`, reaktiviert laufende Instanz).
+- **Einstellungen = natives PyObjC-Fenster** (`run_settings_window` + reine, testbare
+  `parse_relay_settings`), kein rumps-Prompt-Stapel mehr. Bewusst **app-agnostisch**
+  (Feldspec + `on_commit`-Callback), damit der Builder später in ein gemeinsames Modul
+  der Python-Menübar-Familie (mailrelay/icloud-sync/evcc) wandern kann. Speichern/
+  Abbrechen; Passwort via `NSSecureTextField` (leer = unverändert); Seiteneffekte
+  (Login-Item/pf) nur bei Zustandswechsel; Relay-Neustart nur bei Listener-Änderung.
+
+## Richtung: rumps → PyObjC (gestaffelt, analog evcc-menu)
+Strategie der Python-Familie: bei Python bleiben, UI schrittweise auf PyObjC
+vereinheitlichen, rumps mittelfristig ablösen (eine Sprache, ein Repo, Tests bleiben,
+kein IPC). Der aktuelle Dual-Style (rumps-Menü + PyObjC-Fenster) ist Übergang. Erledigt:
+Settings-Fenster (Baustein 1). Offen: gemeinsames `menubar-ui`-Modul extrahieren +
+icloud-sync/evcc darauf umstellen; dann `NSAlert`-Helfer, `NSStatusItem`+`NSMenu`,
+`NSTimer`, Notifications, eigene Runloop → rumps raus. Keychain dann über das
+Security-Framework statt `security`-CLI (löst M2).
 
 ## Was NICHT im Repo liegt (pro-Mac neu einrichten)
 - Laufzeit-Config `~/Library/Application Support/MailRelay/config.json`

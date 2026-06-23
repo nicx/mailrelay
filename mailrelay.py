@@ -607,6 +607,206 @@ class RelayWorker(threading.Thread):
                 pass
 
 
+# ------------------------------------------------- Settings-Fenster (PyObjC) ---
+# Rumps-freies, feldgetriebenes Einstellungsfenster – Baustein 1 der schrittweisen
+# rumps->PyObjC-Vereinheitlichung (analog evcc-menu/icloud-sync). Bewusst app-agnostisch:
+# Validierung/Persistenz stecken im `on_commit`-Callback, damit dieser Builder später
+# unverändert in ein gemeinsames Modul wandern kann.
+try:  # AppKit nur lazy/guarded – das Modul bleibt auch ohne GUI importierbar
+    from Foundation import NSObject as _NSObject
+    _HAVE_APPKIT = True
+except Exception:  # pragma: no cover - umgebungsabhängig
+    _NSObject = object
+    _HAVE_APPKIT = False
+
+_SETTINGS_OK = 1000
+_SETTINGS_CANCEL = 0
+
+
+def parse_relay_settings(raw):
+    """Validiert die Roh-Eingaben des Settings-Fensters (reine Logik, AppKit-frei,
+    unit-testbar). Gibt ``(values, errors, dropped_peers)`` zurück; ``values`` enthält nur
+    die ``cfg``-Felder (kein Passwort, keine Seiteneffekt-Schalter)."""
+    errors = []
+
+    def _port(key, label):
+        v = str(raw.get(key, "")).strip()
+        if v.isdigit() and 1 <= int(v) <= 65535:
+            return int(v)
+        errors.append(f"{label}: Zahl 1–65535")
+        return None
+
+    listen_port = _port("listen_port", "Listen-Port")
+    upstream_port = _port("upstream_port", "Upstream-Port")
+
+    peers, dropped = [], []
+    for p in [x.strip() for x in str(raw.get("allowed_peers", "")).split(",") if x.strip()]:
+        try:
+            ipaddress.ip_network(p, strict=False)
+            peers.append(p)
+        except ValueError:
+            dropped.append(p)
+
+    if errors:
+        return None, errors, dropped
+    values = {
+        "listen_host": str(raw.get("listen_host", "")).strip(),
+        "listen_port": listen_port,
+        "upstream_host": str(raw.get("upstream_host", "")).strip(),
+        "upstream_port": upstream_port,
+        "username": str(raw.get("username", "")).strip(),
+        "use_starttls": bool(raw.get("use_starttls")),
+        "force_sender": str(raw.get("force_sender", "")).strip(),
+        "allowed_peers": peers,
+    }
+    return values, [], dropped
+
+
+class _SettingsController(_NSObject):  # type: ignore[misc]
+    """Hält die Controls am Leben und bedient Speichern/Abbrechen (Target/Action) für die
+    Dauer des modalen Fensters."""
+
+    def ok_(self, _sender):
+        import AppKit
+        raw = {}
+        for key, (kind, control) in self._controls.items():
+            if kind == "check":
+                raw[key] = control.state() == 1
+            else:  # text | int | secret
+                raw[key] = control.stringValue()
+        errors = self._on_commit(raw)
+        if errors:
+            AppKit.NSBeep()
+            self._error_label.setStringValue_("  •  ".join(errors))
+            self._error_label.setHidden_(False)
+            return  # modal offen lassen, damit der Nutzer korrigieren kann
+        AppKit.NSApplication.sharedApplication().stopModalWithCode_(_SETTINGS_OK)
+
+    def cancel_(self, _sender):
+        import AppKit
+        AppKit.NSApplication.sharedApplication().stopModalWithCode_(_SETTINGS_CANCEL)
+
+
+def run_settings_window(title, sections, initial, on_commit):
+    """Zeigt ein modales, feldgetriebenes Einstellungsfenster (Main-Thread).
+
+    ``sections``: ``list[(section_title, rows, note|None)]`` mit
+    ``rows = list[(label, kind, key)]``, ``kind ∈ text|int|secret|check``.
+    ``initial``: ``dict`` key->``str``|``bool``. ``on_commit(raw) -> list[str]``: leere Liste
+    = übernehmen + schließen, sonst Fehlertexte (Fenster bleibt offen, Beep).
+    Rückgabe: ``True`` bei Speichern, ``False`` bei Abbrechen.
+    """
+    import AppKit
+    from Foundation import NSMakeRect, NSMakeSize
+
+    controller = _SettingsController.alloc().init()
+    controller._controls = {}
+    controller._on_commit = on_commit
+    pending = []
+
+    def _label(text, bold=False, dim=False):
+        lbl = AppKit.NSTextField.labelWithString_(text)
+        if bold:
+            lbl.setFont_(AppKit.NSFont.boldSystemFontOfSize_(13))
+        if dim:
+            lbl.setTextColor_(AppKit.NSColor.secondaryLabelColor())
+        return lbl
+
+    def _make_control(kind, key):
+        value = initial.get(key)
+        if kind == "check":
+            btn = AppKit.NSButton.checkboxWithTitle_target_action_("", None, None)
+            btn.setState_(1 if value else 0)
+            return btn
+        cls = AppKit.NSSecureTextField if kind == "secret" else AppKit.NSTextField
+        field = cls.alloc().init()
+        field.setStringValue_("" if value is None else str(value))
+        field.setTranslatesAutoresizingMaskIntoConstraints_(False)
+        pending.append(field.widthAnchor().constraintGreaterThanOrEqualToConstant_(240))
+        return field
+
+    stack = AppKit.NSStackView.alloc().init()
+    stack.setOrientation_(1)  # vertikal
+    stack.setAlignment_(AppKit.NSLayoutAttributeLeading)
+    stack.setSpacing_(10)
+    stack.setTranslatesAutoresizingMaskIntoConstraints_(False)
+
+    first_field = None
+    for si, (section_title, rows, note) in enumerate(sections):
+        if si > 0:
+            sep = AppKit.NSBox.alloc().init()
+            sep.setBoxType_(AppKit.NSBoxSeparator)
+            stack.addArrangedSubview_(sep)
+            pending.append(sep.widthAnchor().constraintEqualToAnchor_(stack.widthAnchor()))
+        stack.addArrangedSubview_(_label(section_title, bold=True))
+        grid_rows = []
+        for label, kind, key in rows:
+            control = _make_control(kind, key)
+            controller._controls[key] = (kind, control)
+            if first_field is None and kind not in ("check",):
+                first_field = control
+            grid_rows.append([_label(label + ":"), control])
+        grid = AppKit.NSGridView.gridViewWithViews_(grid_rows)
+        grid.setRowSpacing_(6)
+        grid.setColumnSpacing_(8)
+        grid.columnAtIndex_(0).setXPlacement_(AppKit.NSGridCellPlacementTrailing)
+        stack.addArrangedSubview_(grid)
+        if note:
+            stack.addArrangedSubview_(_label(note, dim=True))
+
+    error_label = _label("")
+    error_label.setTextColor_(AppKit.NSColor.systemRedColor())
+    error_label.setHidden_(True)
+    controller._error_label = error_label
+    stack.addArrangedSubview_(error_label)
+
+    cancel_btn = AppKit.NSButton.buttonWithTitle_target_action_("Abbrechen", controller, "cancel:")
+    cancel_btn.setKeyEquivalent_("\x1b")  # Esc
+    ok_btn = AppKit.NSButton.buttonWithTitle_target_action_("Speichern", controller, "ok:")
+    ok_btn.setKeyEquivalent_("\r")  # Enter = Default
+    button_row = AppKit.NSStackView.alloc().init()
+    button_row.setOrientation_(0)  # horizontal
+    button_row.setSpacing_(10)
+    spacer = AppKit.NSView.alloc().init()
+    spacer.setContentHuggingPriority_forOrientation_(1, 0)  # dehnt sich
+    button_row.addArrangedSubview_(spacer)
+    button_row.addArrangedSubview_(cancel_btn)
+    button_row.addArrangedSubview_(ok_btn)
+    button_row.setTranslatesAutoresizingMaskIntoConstraints_(False)
+    stack.addArrangedSubview_(button_row)
+    pending.append(button_row.widthAnchor().constraintEqualToAnchor_(stack.widthAnchor()))
+
+    style = AppKit.NSWindowStyleMaskTitled | AppKit.NSWindowStyleMaskClosable
+    window = AppKit.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+        NSMakeRect(0, 0, 520, 560), style, AppKit.NSBackingStoreBuffered, False)
+    window.setTitle_(title)
+    window.setReleasedWhenClosed_(False)
+    controller._window = window
+
+    content = window.contentView()
+    content.addSubview_(stack)
+    AppKit.NSLayoutConstraint.activateConstraints_([
+        stack.leadingAnchor().constraintEqualToAnchor_constant_(content.leadingAnchor(), 16),
+        stack.trailingAnchor().constraintEqualToAnchor_constant_(content.trailingAnchor(), -16),
+        stack.topAnchor().constraintEqualToAnchor_constant_(content.topAnchor(), 16),
+        stack.bottomAnchor().constraintEqualToAnchor_constant_(content.bottomAnchor(), -16),
+    ] + pending)
+
+    content.layoutSubtreeIfNeeded()
+    fitting = stack.fittingSize()
+    window.setContentSize_(NSMakeSize(max(500, fitting.width + 32), fitting.height + 32))
+    if first_field is not None:
+        window.setInitialFirstResponder_(first_field)
+
+    app = AppKit.NSApplication.sharedApplication()
+    app.activateIgnoringOtherApps_(True)
+    window.center()
+    window.makeKeyAndOrderFront_(None)
+    response = app.runModalForWindow_(window)
+    window.orderOut_(None)
+    return response == _SETTINGS_OK
+
+
 # --------------------------------------------------------------- Menü-App ---
 class MailRelayApp(rumps.App):
     def __init__(self):
@@ -627,45 +827,16 @@ class MailRelayApp(rumps.App):
         self.queue_item = rumps.MenuItem("Warteschlange: 0", callback=self.flush_now)
         self.sent_item = rumps.MenuItem("Gesendet: 0")
 
-        self.tls_item = rumps.MenuItem("STARTTLS verwenden", callback=self.toggle_tls)
-        self.tls_item.state = 1 if self.cfg.get("use_starttls", True) else 0
-
-        self.login_item = rumps.MenuItem("Beim Login starten", callback=self.toggle_login_item)
-        self.login_item.state = 1 if login_item_enabled() else 0
-
-        self.pf_item = rumps.MenuItem(
-            "Port 25 weiterleiten (25 → %s)" % self.cfg.get("listen_port", 2525),
-            callback=self.toggle_port25,
-        )
-        self.pf_item.state = 1 if port25_redirect_enabled() else 0
-
-        settings = rumps.MenuItem("Einstellungen")
-        settings.update([
-            rumps.MenuItem("Listen-Host…", callback=self.set_listen_host),
-            rumps.MenuItem("Listen-Port…", callback=self.set_listen_port),
-            rumps.MenuItem("Erlaubte Absender…", callback=self.set_allowed_peers),
-            None,
-            rumps.MenuItem("Upstream-Host…", callback=self.set_upstream_host),
-            rumps.MenuItem("Upstream-Port…", callback=self.set_upstream_port),
-            rumps.MenuItem("Benutzername…", callback=self.set_username),
-            rumps.MenuItem("Passwort…", callback=self.set_password),
-            rumps.MenuItem("Absender erzwingen…", callback=self.set_force_sender),
-            self.tls_item,
-            None,
-            self.login_item,
-            self.pf_item,
-            rumps.MenuItem("Konfigurationsdatei öffnen…", callback=self.open_config),
-        ])
-
         self.menu = [
             self.status_item,
             self.toggle_item,
             None,
             self.queue_item,
             self.sent_item,
-            rumps.MenuItem("Log öffnen…", callback=self.open_log),
             None,
-            settings,
+            rumps.MenuItem("Einstellungen…", callback=self.open_settings),
+            rumps.MenuItem("Log öffnen…", callback=self.open_log),
+            rumps.MenuItem("Konfigurationsdatei öffnen…", callback=self.open_config),
             None,
             rumps.MenuItem("Beenden", callback=self.quit_app),
         ]
@@ -680,13 +851,6 @@ class MailRelayApp(rumps.App):
             self.start_relay()
 
     # -------------------------------------------------------- Hilfsfunktionen
-    def prompt(self, message, default=""):
-        w = rumps.Window(message=message, title=APP_NAME,
-                         default_text=str(default), ok="Speichern",
-                         cancel="Abbrechen", dimensions=(320, 24))
-        resp = w.run()
-        return resp.text.strip() if resp.clicked else None
-
     def tick(self, _):
         try:
             n = len(list(SPOOL.glob("*.json")))
@@ -783,119 +947,106 @@ class MailRelayApp(rumps.App):
             self.stop_relay()
             self.start_relay()
 
-    def set_listen_host(self, _):
-        v = self.prompt("Listen-Host (z. B. 127.0.0.1 oder 0.0.0.0):",
-                        self.cfg["listen_host"])
-        if v is not None:
-            self.cfg["listen_host"] = v
-            save_config(self.cfg)
-            self._restart_hint()
+    def open_settings(self, _):
+        """Öffnet das native PyObjC-Einstellungsfenster (alle Felder auf einen Blick)."""
+        sections = [
+            ("Listener", [
+                ("Listen-Host", "text", "listen_host"),
+                ("Listen-Port", "int", "listen_port"),
+            ], "0.0.0.0 = im LAN erreichbar, 127.0.0.1 = nur lokal."),
+            ("Upstream", [
+                ("Host", "text", "upstream_host"),
+                ("Port", "int", "upstream_port"),
+                ("Benutzername", "text", "username"),
+                ("Passwort", "secret", "password"),
+                ("STARTTLS verwenden", "check", "use_starttls"),
+            ], "Port 587 = STARTTLS, 465 = SSL, 25 = plain. Passwort leer lassen = "
+               "unverändert. AUTH wird nur über TLS gesendet."),
+            ("Sicherheit / Absender", [
+                ("Absender erzwingen", "text", "force_sender"),
+                ("Erlaubte Absender", "text", "allowed_peers"),
+            ], "Absender erzwingen: Upstream-Adresse → Envelope + From: werden "
+               "umgeschrieben (leer = aus).\nErlaubte Absender: IP/CIDR, kommagetrennt "
+               "(leer = alle erlauben)."),
+            ("System", [
+                ("Beim Login starten", "check", "login_item"),
+                ("Port 25 weiterleiten (pf)", "check", "port25"),
+            ], "Login-Autostart braucht die installierte .app. Port-25-Weiterleitung "
+               "fragt nach dem Admin-Passwort."),
+        ]
+        initial = {
+            "listen_host": self.cfg.get("listen_host", ""),
+            "listen_port": self.cfg.get("listen_port", ""),
+            "upstream_host": self.cfg.get("upstream_host", ""),
+            "upstream_port": self.cfg.get("upstream_port", ""),
+            "username": self.cfg.get("username", ""),
+            "password": "",
+            "use_starttls": bool(self.cfg.get("use_starttls", True)),
+            "force_sender": self.cfg.get("force_sender", ""),
+            "allowed_peers": ", ".join(self.cfg.get("allowed_peers") or []),
+            "login_item": login_item_enabled(),
+            "port25": port25_redirect_enabled(),
+        }
+        self._settings_notices = []
+        if run_settings_window("MailRelay – Einstellungen", sections, initial,
+                               self._commit_settings):
+            for note in self._settings_notices:
+                rumps.alert(APP_NAME, note)
 
-    def set_listen_port(self, _):
-        v = self.prompt("Listen-Port (z. B. 2525):", self.cfg["listen_port"])
-        if v is not None and v.isdigit():
-            self.cfg["listen_port"] = int(v)
-            save_config(self.cfg)
-            self._restart_hint()
+    def _commit_settings(self, raw):
+        """Validiert + übernimmt die Fenster-Eingaben. Rückgabe: Fehlerliste (leer =
+        erfolgreich/schließen). Nicht-blockierende Hinweise sammelt ``_settings_notices``."""
+        values, errors, dropped = parse_relay_settings(raw)
+        if errors:
+            return errors
 
-    def set_allowed_peers(self, _):
-        cur = ", ".join(self.cfg.get("allowed_peers") or [])
-        v = self.prompt(
-            "Erlaubte Absender als IP/CIDR, kommagetrennt\n"
-            "(leer = alle erlauben, z. B. 192.168.1.0/24, 10.0.0.5):",
-            cur,
-        )
-        if v is not None:
-            peers = [p.strip() for p in v.split(",") if p.strip()]
-            # Validierung: ungültige Einträge verwerfen und melden
-            valid, invalid = [], []
-            for p in peers:
-                try:
-                    ipaddress.ip_network(p, strict=False)
-                    valid.append(p)
-                except ValueError:
-                    invalid.append(p)
-            self.cfg["allowed_peers"] = valid
-            save_config(self.cfg)
-            if invalid:
-                rumps.alert(APP_NAME, "Ignoriert (keine gültige IP/CIDR):\n" + ", ".join(invalid))
-            self._restart_hint()
-
-    def set_upstream_host(self, _):
-        v = self.prompt("Upstream-SMTP-Host:", self.cfg["upstream_host"])
-        if v is not None:
-            self.cfg["upstream_host"] = v
-            save_config(self.cfg)
-
-    def set_upstream_port(self, _):
-        v = self.prompt("Upstream-Port (587 = STARTTLS, 465 = SSL, 25 = plain):",
-                        self.cfg["upstream_port"])
-        if v is not None and v.isdigit():
-            self.cfg["upstream_port"] = int(v)
-            save_config(self.cfg)
-
-    def set_username(self, _):
-        v = self.prompt("Benutzername (leer lassen = keine Auth):",
-                        self.cfg["username"])
-        if v is not None:
-            self.cfg["username"] = v
-            save_config(self.cfg)
-
-    def set_password(self, _):
-        user = self.cfg.get("username", "")
-        if not user:
-            rumps.alert(APP_NAME, "Bitte zuerst einen Benutzernamen setzen.")
-            return
-        v = self.prompt(f"Passwort für {user} (wird im Schlüsselbund gespeichert):", "")
-        if v is not None:
-            keychain_set(user, v)
-            rumps.notification(APP_NAME, "", "Passwort im Schlüsselbund gespeichert.")
-
-    def set_force_sender(self, _):
-        cur = self.cfg.get("force_sender", "") or self.cfg.get("username", "")
-        v = self.prompt(
-            "Absender erzwingen (Envelope + From:-Header darauf umschreiben).\n"
-            "Leer lassen = aus. Sinnvoll = die Upstream-Account-Adresse, z. B.\n"
-            "wenn der Drucker/Skript einen vom Upstream abgelehnten Absender setzt:",
-            cur,
-        )
-        if v is not None:
-            self.cfg["force_sender"] = v.strip()
-            save_config(self.cfg)
-
-    def toggle_tls(self, sender):
-        sender.state = 0 if sender.state else 1
-        self.cfg["use_starttls"] = bool(sender.state)
+        old = (self.cfg.get("listen_host"), self.cfg.get("listen_port"),
+               self.cfg.get("allowed_peers"))
+        self.cfg.update(values)
         save_config(self.cfg)
+        if dropped:
+            self.log.warning("Ignorierte Absender (keine IP/CIDR): %s", ", ".join(dropped))
+            self._settings_notices.append(
+                "Ignoriert (keine gültige IP/CIDR):\n" + ", ".join(dropped))
 
-    def toggle_login_item(self, sender):
-        want = not bool(sender.state)
-        try:
-            set_login_item(want)
-        except Exception as e:
-            rumps.alert(APP_NAME, f"Login-Autostart konnte nicht geändert werden:\n{e}")
-            return
-        sender.state = 1 if want else 0
-        self.log.info("Login-Autostart: %s", "ein" if want else "aus")
+        # Passwort nur bei Eingabe ändern (leer = unverändert).
+        pw = raw.get("password") or ""
+        if pw:
+            if values["username"]:
+                keychain_set(values["username"], pw)
+            else:
+                self._settings_notices.append(
+                    "Passwort ignoriert – es ist kein Benutzername gesetzt.")
 
-    def toggle_port25(self, sender):
-        want = not bool(sender.state)
-        port = self.cfg.get("listen_port", 2525)
-        if want and int(port) == 25:
-            rumps.alert(APP_NAME, "Listen-Port ist bereits 25 – eine Umleitung ergibt keinen Sinn.")
-            return
-        try:
-            set_port25_redirect(want, port)
-        except Exception as e:
-            rumps.alert(APP_NAME, f"Port-25-Weiterleitung konnte nicht geändert werden:\n{e}")
-            return
-        sender.state = 1 if want else 0
-        self.log.info("Port-25-Weiterleitung: %s (-> %s)", "ein" if want else "aus", port)
-        rumps.notification(
-            APP_NAME, "",
-            f"Port-25-Weiterleitung aktiv: 25 → {port}." if want
-            else "Port-25-Weiterleitung deaktiviert.",
-        )
+        # Seiteneffekt: Login-Autostart nur bei Zustandswechsel.
+        want_login = bool(raw.get("login_item"))
+        if want_login != login_item_enabled():
+            try:
+                set_login_item(want_login)
+                self.log.info("Login-Autostart: %s", "ein" if want_login else "aus")
+            except Exception as e:
+                self._settings_notices.append(f"Login-Autostart nicht geändert:\n{e}")
+
+        # Seiteneffekt: pf-Weiterleitung nur bei Zustandswechsel.
+        want25 = bool(raw.get("port25"))
+        if want25 != port25_redirect_enabled():
+            if want25 and int(values["listen_port"]) == 25:
+                self._settings_notices.append(
+                    "Listen-Port ist 25 – eine Weiterleitung ergibt keinen Sinn.")
+            else:
+                try:
+                    set_port25_redirect(want25, values["listen_port"])
+                    self.log.info("Port-25-Weiterleitung: %s (-> %s)",
+                                  "ein" if want25 else "aus", values["listen_port"])
+                except Exception as e:
+                    self._settings_notices.append(
+                        f"Port-25-Weiterleitung nicht geändert:\n{e}")
+
+        # Relay nur neu starten, wenn Listener-relevante Felder sich änderten.
+        if old != (self.cfg["listen_host"], self.cfg["listen_port"],
+                   self.cfg["allowed_peers"]):
+            self._restart_hint()
+        return []
 
     # ----------------------------------------------------------- Aktionen
     def flush_now(self, _):

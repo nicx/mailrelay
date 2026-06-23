@@ -51,9 +51,10 @@ make run
 
 ## Konfiguration
 
-Beim ersten Start im Menü unter **Einstellungen**: Upstream-Host, Port,
-Benutzername und Passwort setzen. Sobald ein Upstream hinterlegt ist, startet
-das Relay beim nächsten Programmstart automatisch.
+Beim ersten Start im Menü **„Einstellungen…"** (ein natives Fenster mit allen
+Optionen auf einen Blick): Upstream-Host, Port, Benutzername und Passwort setzen.
+Sobald ein Upstream hinterlegt ist, startet das Relay beim nächsten Programmstart
+automatisch.
 
 Config: `~/Library/Application Support/MailRelay/config.json`
 Queue/Log: gleiches Verzeichnis (`spool/`, `failed/`, `mailrelay.log`).
