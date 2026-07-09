@@ -195,8 +195,20 @@ _DEFAULT_PF_CONF = (
 
 
 def port25_redirect_enabled():
-    """True, wenn der pf-LaunchDaemon für die Port-25-Weiterleitung installiert ist."""
-    return PF_DAEMON.exists()
+    """True nur, wenn die Weiterleitung *wirklich aktiv* ist: der pf-LaunchDaemon
+    existiert UND unser Anker steht noch im aktuellen /etc/pf.conf. Ein macOS-Update
+    kann /etc/pf.conf zurücksetzen (Anker weg), während die Daemon-Plist unter
+    /Library/LaunchDaemons bestehen bleibt — das muss als 'aus' gelten, damit die
+    Checkbox nicht fälschlich 'an' zeigt und ein erneutes Anhaken die Weiterleitung
+    repariert, statt in einem No-op zu verpuffen."""
+    return PF_DAEMON.exists() and _anchor_present_in_pf_conf()
+
+
+def _anchor_present_in_pf_conf():
+    return any(
+        line.strip() == _LOAD_ANCHOR_LINE
+        for line in _current_pf_conf().split("\n")
+    )
 
 
 def _run_with_admin(shell_cmd):
