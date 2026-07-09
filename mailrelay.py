@@ -20,6 +20,7 @@ import json
 import time
 import uuid
 import base64
+import socket
 import smtplib
 import logging
 import plistlib
@@ -211,6 +212,13 @@ def _anchor_present_in_pf_conf():
     )
 
 
+def port25_needs_repair():
+    """True, wenn die Weiterleitung eingerichtet *war* (Daemon-Plist existiert), der
+    Anker aber aus /etc/pf.conf verschwunden ist (typisch nach einem macOS-Update).
+    Die Weiterleitung ist dann tot und muss neu eingerichtet werden."""
+    return PF_DAEMON.exists() and not _anchor_present_in_pf_conf()
+
+
 def _run_with_admin(shell_cmd):
     """Führt shell_cmd mit Admin-Rechten aus (macOS-Auth-Dialog). RuntimeError bei
     Abbruch/Fehler (z. B. Passwort-Dialog abgebrochen)."""
@@ -328,6 +336,7 @@ DEFAULTS = {
     "force_sender": "",           # gesetzt = Envelope-MAIL-FROM + From:-Header darauf umschreiben
     "max_retries": 10,
     "allowed_peers": [],          # leer = alle erlaubt; sonst Allowlist aus IPs/CIDR (H1)
+    "alert_email": "",            # gesetzt = Warn-Mail an diese Adresse, wenn die pf-Weiterleitung ausfällt (leer = aus)
 }
 
 # Sicherheits-Konstanten
@@ -666,6 +675,7 @@ def parse_relay_settings(raw):
         "use_starttls": bool(raw.get("use_starttls")),
         "force_sender": str(raw.get("force_sender", "")).strip(),
         "allowed_peers": peers,
+        "alert_email": str(raw.get("alert_email", "")).strip(),
     }
     return values, [], dropped
 
@@ -829,6 +839,10 @@ class MailRelayApp(rumps.App):
         self.sent_count = 0
         self._cur_symbol = None        # aktuell gesetztes Menüleisten-Symbol
         self._icon_cache = {}          # Symbol -> gerenderter Template-PNG-Pfad
+        # pf-Selbstüberwachung: warnt per Mail, wenn die Port-25-Weiterleitung
+        # unerwartet ausfällt (Anker nach macOS-Update aus /etc/pf.conf verschwunden).
+        self._pf_repair_alerted = False
+        self._pf_last_check = 0.0
 
         self.status_item = rumps.MenuItem("Status: gestoppt")
         self.toggle_item = rumps.MenuItem("Start", callback=self.toggle)
@@ -866,6 +880,75 @@ class MailRelayApp(rumps.App):
             n = 0
         self.queue_item.title = f"Warteschlange: {n}"
         self.sent_item.title = f"Gesendet: {self.sent_count}"
+        self._check_pf_alert()
+
+    def _check_pf_alert(self):
+        """Warnt per Mail, wenn die Port-25-Weiterleitung unerwartet ausfällt (Anker
+        nach macOS-Update aus /etc/pf.conf weg) – und schickt eine Entwarnung, sobald
+        sie repariert ist. Höchstens alle 60 s geprüft; dedupliziert über einen State-
+        Schalter. Die Mail läuft über die eigene Warteschlange zum Upstream und ist
+        damit unabhängig von der (eingehenden) Port-25-Weiterleitung."""
+        recipient = (self.cfg.get("alert_email") or "").strip()
+        if not recipient:
+            return
+        now = time.time()
+        if now - self._pf_last_check < 60:
+            return
+        self._pf_last_check = now
+        try:
+            broken = port25_needs_repair()
+        except Exception:
+            return
+        host = socket.gethostname()
+        if broken and not self._pf_repair_alerted:
+            if self._enqueue_alert(
+                recipient,
+                f"MailRelay: Port-25-Weiterleitung inaktiv ({host})",
+                "Die pf-Weiterleitung auf Port 25 ist nicht mehr aktiv "
+                f"(Anker fehlt in /etc/pf.conf – meist nach einem macOS-Update) auf {host}.\n\n"
+                "Eingehende Mail auf Port 25 wird derzeit nicht angenommen. Der ausgehende "
+                "Relay ist davon nicht betroffen.\n\n"
+                "Beheben: MailRelay, Einstellungen, Haken bei ‚Port 25 weiterleiten‘ "
+                "neu setzen und speichern (Admin-Passwort).",
+            ):
+                self._pf_repair_alerted = True
+        elif not broken and self._pf_repair_alerted:
+            if self._enqueue_alert(
+                recipient,
+                f"MailRelay: Port-25-Weiterleitung wieder aktiv ({host})",
+                f"Die pf-Weiterleitung auf Port 25 ist auf {host} wieder eingerichtet.",
+            ):
+                self._pf_repair_alerted = False
+
+    def _enqueue_alert(self, recipient, subject, body):
+        """Legt eine Warn-Mail als RFC-822-Nachricht in die Warteschlange; der Worker
+        stellt sie mit Retry/Backoff zum Upstream zu. Absender = force_sender falls
+        gesetzt, sonst der Empfänger selbst. True bei Erfolg."""
+        from email.message import EmailMessage
+        from email.utils import formatdate, make_msgid
+        try:
+            sender = (self.cfg.get("force_sender") or "").strip() or recipient
+            msg = EmailMessage()
+            msg["From"] = sender
+            msg["To"] = recipient
+            msg["Subject"] = subject
+            msg["Date"] = formatdate(localtime=True)
+            msg["Message-ID"] = make_msgid(domain="mailrelay.local")
+            msg.set_content(body)
+            rec = {
+                "mailfrom": sender,
+                "rcpttos": [recipient],
+                "data": base64.b64encode(msg.as_bytes()).decode(),
+                "attempts": 0,
+                "next_try": 0,
+            }
+            fn = SPOOL / f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}.json"
+            write_private(fn, json.dumps(rec))
+            self.log.info("pf-Warnmail eingereiht: %s -> %s", subject, recipient)
+            return True
+        except Exception as e:
+            self.log.warning("pf-Warnmail nicht eingereiht: %s", e)
+            return False
 
     # ----------------------------------------------------------- Menüleisten-Icon
     def _icon_for(self, symbol):
@@ -979,8 +1062,11 @@ class MailRelayApp(rumps.App):
             ("System", [
                 ("Beim Login starten", "check", "login_item"),
                 ("Port 25 weiterleiten (pf)", "check", "port25"),
+                ("Warn-Mail an", "text", "alert_email"),
             ], "Login-Autostart braucht die installierte .app. Port-25-Weiterleitung "
-               "fragt nach dem Admin-Passwort."),
+               "fragt nach dem Admin-Passwort.\nWarn-Mail an: Adresse, die eine Mail "
+               "erhält, wenn die Port-25-Weiterleitung unerwartet ausfällt (z. B. nach "
+               "einem macOS-Update). Leer = aus."),
         ]
         initial = {
             "listen_host": self.cfg.get("listen_host", ""),
@@ -994,6 +1080,7 @@ class MailRelayApp(rumps.App):
             "allowed_peers": ", ".join(self.cfg.get("allowed_peers") or []),
             "login_item": login_item_enabled(),
             "port25": port25_redirect_enabled(),
+            "alert_email": self.cfg.get("alert_email", ""),
         }
         self._settings_notices = []
         if run_settings_window("MailRelay – Einstellungen", sections, initial,
