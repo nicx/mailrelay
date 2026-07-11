@@ -378,6 +378,12 @@ def peer_allowed(peer, allowed):
         ip = ipaddress.ip_address(peer[0])
     except (ValueError, TypeError, IndexError):
         return False
+    # Loopback (127.0.0.1 UND ::1) ist immer erlaubt: nicht spoofbar (= diese
+    # Maschine) und ein lokaler Client, der zu „localhost" verbindet, kommt auf
+    # macOS je nach Auflösung als IPv4 ODER IPv6 an. Sonst müsste man beide
+    # Formen einzeln in die Allowlist eintragen — häufiger Footgun.
+    if ip.is_loopback:
+        return True
     for entry in allowed:
         try:
             if ip in ipaddress.ip_network(entry, strict=False):
