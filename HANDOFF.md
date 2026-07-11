@@ -78,5 +78,33 @@ icloud-sync/evcc darauf umstellen; dann `NSAlert`-Helfer, `NSStatusItem`+`NSMenu
   **erledigt:** Keychain läuft jetzt über die `keyring`-Library (Security-Framework),
   kein Passwort mehr in der Prozess-Argumentliste.
 
+## Bekanntes Problem: reiner IPv4-Loopback (`127.0.0.1`) nimmt nur 1 Verbindung an
+Direkte Verbindungen von `127.0.0.1` -> `127.0.0.1:2525` funktionieren nur **einmal**;
+danach bleibt der TCP-Handshake hängen (Client `SYN_SENT` / Server `SYN_RCVD`), bis der
+Listener nach kurzer Idle-Zeit wieder „einen Schuss" freigibt. **Nur reiner IPv4-Loopback
+ist betroffen** – nicht die LAN-IP und nicht IPv6.
+
+Eingegrenzt (2026-07-11):
+- **pf ausgeschlossen** (Anker `mailrelay` geleert -> Bug bleibt).
+- **Code/aiosmtpd ausgeschlossen** (identischer Controller/Handler aus dem Quelltext im
+  venv-Python nimmt Loopback unbegrenzt an; trivialer asyncio-Server auf `127.0.0.1` ebenso).
+- Reproduziert **nur im py2app-Bundle-Prozess** (der die kopierte Homebrew-Runtime nutzt,
+  die als venv sauber läuft) – ab der ersten Verbindung, auch bei frischer Instanz.
+  Verdacht: Prozess-/Startkontext des per LaunchServices gestarteten Bundles. Grundursache
+  noch offen; nächste Schritte: Bundle-Binary im Vordergrund mit sichtbarem stderr (das
+  Bundle wirft stderr sonst nach `/dev/null` -> asyncio-Traceback geht verloren) oder
+  `sudo tcpdump -i lo0 port 2525` während eines hängenden Verbindungsaufbaus.
+
+**Workaround / Empfehlung:** Lokale Sender auf **`192.168.2.1`** (LAN-IP des Mac, in der
+Allowlist über `192.168.2.0/24` abgedeckt) **oder `::1`** statt `127.0.0.1` zeigen lassen.
+Beide nehmen unbegrenzt an (verifiziert). Betroffene lokale Sender im Haus, die per Default
+`127.0.0.1:2525` nutzen: **icloud-sync, evcc, home-assistant- und esphome-Menübar-App**.
+Der reguläre Mailfluss (Gerät -> `LAN-IP:25` -> pf-rdr -> `127.0.0.1:2525`) ist **nicht**
+betroffen, weil die Quelle dort die LAN-Adresse bleibt (kein reiner Loopback).
+
+Nebenbei am 2026-07-11 gefixt (Commit `868f944`): `peer_allowed` erlaubt Loopback jetzt
+grundsätzlich (`ip.is_loopback`), sonst wurde ein zu „localhost" verbindender Client, der
+auf macOS als `::1` ankommt, trotz `127.0.0.1` in der Allowlist mit `550` abgelehnt.
+
 ## Git-Identität / Account
 Repo unter GitHub-Account **nicx** (`https://github.com/nicx/mailrelay`).
