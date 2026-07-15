@@ -394,6 +394,18 @@ def peer_allowed(peer, allowed):
     return False
 
 
+def peer_str(peer):
+    """Formatiert die Peer-Adresse als ``ip:port`` fürs Log. pf schreibt bei der
+    Port-25-Weiterleitung den *Ziel*-Port bereits vor dem accept auf 2525 um – die
+    App sieht also nie „25". Die **Quell-IP** bleibt aber erhalten, und daran lassen
+    sich Port-25-Kandidaten erkennen: ein externes LAN-Gerät (z. B. der Scanner) kam
+    über die Weiterleitung, lokale Sender erscheinen als 127.0.0.1/::1/eigene LAN-IP."""
+    try:
+        return f"{peer[0]}:{peer[1]}"
+    except (TypeError, IndexError):
+        return str(peer)
+
+
 def queue_count():
     try:
         return sum(1 for _ in SPOOL.glob("*.json"))
@@ -462,7 +474,7 @@ class RelayHandler:
         # H1: optionale Peer-Allowlist gegen offenes Relay
         allowed = self.app.cfg.get("allowed_peers") or []
         if not peer_allowed(session.peer, allowed):
-            self.log.warning("Abgelehnt (Peer nicht in Allowlist): %s", session.peer)
+            self.log.warning("Abgelehnt (Peer nicht in Allowlist): %s", peer_str(session.peer))
             return "550 Sender host not allowed"
 
         # M3: Warteschlange begrenzen (DoS-Schutz)
@@ -479,8 +491,8 @@ class RelayHandler:
         }
         fn = self.spool_dir / f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}.json"
         write_private(fn, json.dumps(rec))
-        self.log.info("Angenommen: %s -> %s (%s)",
-                      envelope.mail_from, envelope.rcpt_tos, fn.name)
+        self.log.info("Angenommen von %s: %s -> %s (%s)",
+                      peer_str(session.peer), envelope.mail_from, envelope.rcpt_tos, fn.name)
         return "250 Message accepted for delivery"
 
 
