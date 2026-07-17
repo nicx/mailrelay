@@ -57,6 +57,21 @@ make run PYTHON=/opt/homebrew/bin/python3.13          # aus Quelltext testen
   der Python-Menübar-Familie (mailrelay/icloud-sync/evcc) wandern kann. Speichern/
   Abbrechen; Passwort via `NSSecureTextField` (leer = unverändert); Seiteneffekte
   (Login-Item/pf) nur bei Zustandswechsel; Relay-Neustart nur bei Listener-Änderung.
+- **Settings-Fenster ist bewusst NICHT app-modal** (seit 2026-07-17). `runModalForWindow_`
+  hatte die App an einem Tag zweimal komplett gesperrt: Während eines App-modalen Loops
+  graut AppKit **alle** Menüleisten-Einträge aus, und als `LSUIElement` (kein Dock-Icon)
+  gibt es keinen Weg, ein Fenster wiederzufinden, das den Fokus verloren hat oder außerhalb
+  des sichtbaren Bereichs liegt (VNC, Auflösungswechsel, anderer Space) – die App war
+  unbedienbar, während der Relay munter weiterlief. Jetzt: normales Fenster + Delegate,
+  `on_done(saved)`-Callback statt synchronem Rückgabewert (nicht-modal kann nicht warten),
+  erneutes Öffnen holt das Fenster nach vorn **und zentriert neu** (rettet ein verirrtes
+  Fenster zurück). Zwei Fallstricke, die dabei gelöst sind: `_SETTINGS_OPEN` muss den
+  Controller halten (NSWindow-Delegate und Button-Targets sind **schwache** Referenzen –
+  sonst sammelt der Python-GC ihn ein und die Buttons sind tot), und reine Python-Helfer
+  mit Argumenten in der NSObject-Subklasse brauchen `@_python_method`, sonst macht PyObjC
+  einen Selector daraus (`BadPrototypeError`). ⚠️ **NICHT** auf `runModalForWindow_`
+  zurückbauen. Symptom, falls doch: Menüs ausgegraut, `sample <pid>` zeigt den Main-Thread
+  in `-[NSApplication runModalForWindow:]`.
 
 ## Richtung: rumps → PyObjC (gestaffelt, analog evcc-menu)
 Strategie der Python-Familie: bei Python bleiben, UI schrittweise auf PyObjC

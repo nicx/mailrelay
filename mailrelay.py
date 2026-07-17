@@ -649,13 +649,21 @@ class RelayWorker(threading.Thread):
 # unverändert in ein gemeinsames Modul wandern kann.
 try:  # AppKit nur lazy/guarded – das Modul bleibt auch ohne GUI importierbar
     from Foundation import NSObject as _NSObject
+    # PyObjC macht aus jeder Methode einer NSObject-Subklasse einen ObjC-Selector; reine
+    # Python-Helfer mit Argumenten müssen darum ausgenommen werden (sonst BadPrototypeError).
+    from objc import python_method as _python_method
     _HAVE_APPKIT = True
 except Exception:  # pragma: no cover - umgebungsabhängig
     _NSObject = object
+
+    def _python_method(fn):   # Fallback ohne PyObjC
+        return fn
     _HAVE_APPKIT = False
 
-_SETTINGS_OK = 1000
-_SETTINGS_CANCEL = 0
+# Offene, nicht-modale Settings-Fenster müssen am Leben gehalten werden: NSWindow-Delegate
+# und Button-Targets sind in AppKit *schwache* Referenzen – ohne diese Registry würde der
+# Controller vom Python-GC eingesammelt und Speichern/Abbrechen liefen ins Leere.
+_SETTINGS_OPEN = {}   # title -> _SettingsController
 
 
 def parse_relay_settings(raw):
@@ -699,8 +707,8 @@ def parse_relay_settings(raw):
 
 
 class _SettingsController(_NSObject):  # type: ignore[misc]
-    """Hält die Controls am Leben und bedient Speichern/Abbrechen (Target/Action) für die
-    Dauer des modalen Fensters."""
+    """Hält Controls/Fenster am Leben, bedient Speichern/Abbrechen (Target/Action) und
+    dient dem Fenster als Delegate (Schließen über den roten Button = Abbrechen)."""
 
     def ok_(self, _sender):
         import AppKit
@@ -715,25 +723,59 @@ class _SettingsController(_NSObject):  # type: ignore[misc]
             AppKit.NSBeep()
             self._error_label.setStringValue_("  •  ".join(errors))
             self._error_label.setHidden_(False)
-            return  # modal offen lassen, damit der Nutzer korrigieren kann
-        AppKit.NSApplication.sharedApplication().stopModalWithCode_(_SETTINGS_OK)
+            return  # Fenster offen lassen, damit der Nutzer korrigieren kann
+        self._finish(True)
 
     def cancel_(self, _sender):
-        import AppKit
-        AppKit.NSApplication.sharedApplication().stopModalWithCode_(_SETTINGS_CANCEL)
+        self._finish(False)
+
+    def windowWillClose_(self, _notification):
+        self._finish(False)
+
+    @_python_method
+    def _finish(self, saved):
+        """Schließt das Fenster genau einmal, gibt die Registry-Referenz frei und meldet
+        das Ergebnis an ``on_done``. Der ``_done``-Schalter schützt gegen Doppelaufruf
+        (roter Button feuert zusätzlich ``windowWillClose_``)."""
+        if self._done:
+            return
+        self._done = True
+        self._window.setDelegate_(None)
+        self._window.orderOut_(None)
+        _SETTINGS_OPEN.pop(self._key, None)
+        if self._on_done is not None:
+            self._on_done(saved)
 
 
-def run_settings_window(title, sections, initial, on_commit):
-    """Zeigt ein modales, feldgetriebenes Einstellungsfenster (Main-Thread).
+def run_settings_window(title, sections, initial, on_commit, on_done=None):
+    """Zeigt ein **nicht-modales**, feldgetriebenes Einstellungsfenster (Main-Thread).
+
+    **Bewusst nicht app-modal:** Eine reine Menüleisten-App (``LSUIElement``, kein Dock-Icon)
+    sperrt sich mit ``runModalForWindow_`` komplett aus, sobald das Fenster den Fokus verliert
+    oder außerhalb des sichtbaren Bereichs landet (VNC, Auflösungswechsel, anderer Space):
+    AppKit graut während eines App-modalen Loops alle Menüs aus, und ohne Dock-Icon gibt es
+    keinen Weg, das Fenster wiederzufinden – die App ist dann unbedienbar. Nicht-modal bleibt
+    sie in jedem Fall benutzbar. NICHT auf ``runModalForWindow_`` zurückbauen.
 
     ``sections``: ``list[(section_title, rows, note|None)]`` mit
     ``rows = list[(label, kind, key)]``, ``kind ∈ text|int|secret|check``.
     ``initial``: ``dict`` key->``str``|``bool``. ``on_commit(raw) -> list[str]``: leere Liste
     = übernehmen + schließen, sonst Fehlertexte (Fenster bleibt offen, Beep).
-    Rückgabe: ``True`` bei Speichern, ``False`` bei Abbrechen.
+    ``on_done(saved: bool)``: optional; ``True`` nach Speichern, ``False`` nach Abbrechen/
+    Schließen. Ersetzt den früheren synchronen Rückgabewert (nicht-modal kann nicht warten).
+
+    Ist das Fenster bereits offen, wird es nur nach vorn geholt **und neu zentriert** – das
+    holt auch ein außerhalb des Viewports verirrtes Fenster zurück.
     """
     import AppKit
     from Foundation import NSMakeRect, NSMakeSize
+
+    existing = _SETTINGS_OPEN.get(title)
+    if existing is not None:
+        AppKit.NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+        existing._window.center()
+        existing._window.makeKeyAndOrderFront_(None)
+        return
 
     controller = _SettingsController.alloc().init()
     controller._controls = {}
@@ -834,13 +876,17 @@ def run_settings_window(title, sections, initial, on_commit):
     if first_field is not None:
         window.setInitialFirstResponder_(first_field)
 
+    controller._window = window
+    controller._on_done = on_done
+    controller._done = False
+    controller._key = title
+    window.setDelegate_(controller)
+    _SETTINGS_OPEN[title] = controller   # Referenz halten, s. Kommentar bei _SETTINGS_OPEN
+
     app = AppKit.NSApplication.sharedApplication()
     app.activateIgnoringOtherApps_(True)
     window.center()
     window.makeKeyAndOrderFront_(None)
-    response = app.runModalForWindow_(window)
-    window.orderOut_(None)
-    return response == _SETTINGS_OK
 
 
 # --------------------------------------------------------------- Menü-App ---
@@ -1101,10 +1147,16 @@ class MailRelayApp(rumps.App):
             "alert_email": self.cfg.get("alert_email", ""),
         }
         self._settings_notices = []
-        if run_settings_window("MailRelay – Einstellungen", sections, initial,
-                               self._commit_settings):
-            for note in self._settings_notices:
-                rumps.alert(APP_NAME, note)
+
+        def _done(saved):
+            # Läuft nach Speichern/Abbrechen; das Fenster ist nicht-modal, daher kann
+            # open_settings nicht mehr auf ein Ergebnis warten (s. run_settings_window).
+            if saved:
+                for note in self._settings_notices:
+                    rumps.alert(APP_NAME, note)
+
+        run_settings_window("MailRelay – Einstellungen", sections, initial,
+                            self._commit_settings, _done)
 
     def _commit_settings(self, raw):
         """Validiert + übernimmt die Fenster-Eingaben. Rückgabe: Fehlerliste (leer =
