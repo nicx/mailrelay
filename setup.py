@@ -14,7 +14,11 @@ DATA_FILES = []
 OPTIONS = {
     "argv_emulation": False,
     "iconfile": "assets/icon.icns",
-    "packages": ["rumps", "aiosmtpd", "keyring"],
+    "packages": ["aiosmtpd", "keyring"],
+    # AppKit/Foundation/UserNotifications werden lazy in Funktionen importiert (damit das
+    # Modul ohne GUI importierbar bleibt). Explizit aufführen, damit sie sicher im Bundle
+    # landen und nicht von der Import-Analyse übersehen werden.
+    "includes": ["objc", "AppKit", "Foundation", "UserNotifications"],
     # Menüleisten-Template-Icon landet in Contents/Resources/
     "resources": ["assets/menubar.png"],
     "plist": {
@@ -25,7 +29,7 @@ OPTIONS = {
         "CFBundleShortVersionString": "1.0.0",
         # Menüleisten-App: kein Dock-Icon, kein App-Switcher-Eintrag
         "LSUIElement": True,
-        "NSHumanReadableCopyright": "MIT License",
+        "NSHumanReadableCopyright": "MIT – nicx",
     },
 }
 

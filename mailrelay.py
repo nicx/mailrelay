@@ -7,8 +7,12 @@ Neustarts) und reicht sie an einen Upstream-SMTP-Server weiter - optional mit
 SMTP-AUTH + STARTTLS, mit Retry/Backoff bei Fehlern. Das Passwort liegt im
 macOS-Schlüsselbund (Keychain), nicht im Klartext.
 
+Die UI ist vollständig PyObjC/AppKit (Statusleiste, Menü, Fenster, Dialoge, Timer,
+Notifications) – ``rumps`` wird nicht mehr benötigt.
+
 Setup:
-    python3 -m pip install --user rumps aiosmtpd
+    python3 -m pip install --user pyobjc-framework-Cocoa \
+        pyobjc-framework-UserNotifications aiosmtpd keyring
 Start:
     python3 mailrelay.py        # erscheint als Briefumschlag-Icon in der Menüleiste
 """
@@ -29,7 +33,6 @@ import threading
 import subprocess
 from pathlib import Path
 
-import rumps
 import keyring
 from aiosmtpd.controller import Controller
 
@@ -74,9 +77,9 @@ def render_sf_menubar_icon(symbol="envelope"):
     """Rendert das SF-Symbol als Template-PNG nach App Support und gibt den Pfad
     zurück. None, wenn nicht möglich (z. B. macOS < 11) -> Fallback auf ICON.
 
-    Quadratischer Bitmap-Rep mit erhaltenem Seitenverhältnis, weil rumps das
-    Menüleisten-Icon auf 20x20 zwingt; ein nicht-quadratisches Bild würde sonst
-    gestaucht.
+    Quadratischer Bitmap-Rep mit erhaltenem Seitenverhältnis, weil ``StatusItem``
+    das Menüleisten-Icon per ``setSize_`` auf 20x20 pt setzt (ohne das deutet NSImage
+    die Pixelmaße als Punkte); ein nicht-quadratisches Bild würde sonst gestaucht.
     """
     try:
         import AppKit
@@ -889,10 +892,278 @@ def run_settings_window(title, sections, initial, on_commit, on_done=None):
     window.makeKeyAndOrderFront_(None)
 
 
-# --------------------------------------------------------------- Menü-App ---
-class MailRelayApp(rumps.App):
+# ------------------------------------------ Statusleiste / Timer / Dialoge ---
+# Baustein 2 der rumps->PyObjC-Vereinheitlichung (analog evcc/icloud-sync): ersetzt
+# rumps.App/MenuItem, rumps.Timer, rumps.alert und rumps.notification. Wie der
+# Settings-Builder oben bewusst app-agnostisch gehalten, damit alles später unverändert
+# in ein gemeinsames Modul wandern kann.
+
+
+def _run_on_main_sync(fn):
+    """Führt ``fn()`` synchron auf dem Main-Thread aus; reicht Rückgabe/Fehler durch.
+
+    AppKit ist nicht thread-sicher, der Relay-Worker läuft aber in eigenen Threads.
+    Auf dem Main-Thread direkt (kein Dispatch, keine Deadlock-Gefahr).
+    """
+    from Foundation import NSOperationQueue, NSThread
+
+    if NSThread.isMainThread():
+        return fn()
+
+    box, done = {}, threading.Event()
+
+    def _wrapper():
+        try:
+            box["value"] = fn()
+        except Exception as exc:  # noqa: BLE001 - an den Aufrufer weiterreichen
+            box["error"] = exc
+        finally:
+            done.set()
+
+    NSOperationQueue.mainQueue().addOperationWithBlock_(_wrapper)
+    done.wait()
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
+
+
+def alert(title, message=""):
+    """Modaler Hinweis mit OK-Button (Ersatz für ``rumps.alert``)."""
+    def _show():
+        import AppKit
+
+        a = AppKit.NSAlert.alloc().init()
+        a.setMessageText_(title)
+        if message:
+            a.setInformativeText_(message)
+        a.addButtonWithTitle_("OK")
+        AppKit.NSApp.activateIgnoringOtherApps_(True)
+        a.runModal()
+
+    _run_on_main_sync(_show)
+
+
+_notify_auth_lock = threading.Lock()
+_notify_auth_done = False
+
+
+def notify(title, subtitle, message):
+    """macOS-Notification über ``UNUserNotificationCenter`` (best effort, asynchron).
+
+    Ersetzt ``rumps.notification``. Zustellung nur aus dem echten, signierten Bundle
+    (App-Stub) – im Dev-Modus lehnt macOS ab, das wird nur geloggt.
+    """
+    from Foundation import NSOperationQueue
+
+    def _deliver():
+        global _notify_auth_done
+        try:
+            import UserNotifications as UN
+
+            center = UN.UNUserNotificationCenter.currentNotificationCenter()
+            with _notify_auth_lock:
+                first = not _notify_auth_done
+                _notify_auth_done = True
+            if first:
+                center.requestAuthorizationWithOptions_completionHandler_(
+                    UN.UNAuthorizationOptionAlert | UN.UNAuthorizationOptionSound,
+                    lambda granted, error: None)
+
+            content = UN.UNMutableNotificationContent.alloc().init()
+            content.setTitle_(title)
+            if subtitle:
+                content.setSubtitle_(subtitle)
+            content.setBody_(message)
+            req = UN.UNNotificationRequest.requestWithIdentifier_content_trigger_(
+                str(uuid.uuid4()), content, None)
+            center.addNotificationRequest_withCompletionHandler_(req, None)
+        except Exception as exc:  # noqa: BLE001 - Notifications sind best effort
+            logging.getLogger(APP_NAME).warning("Notification fehlgeschlagen: %s", exc)
+
+    NSOperationQueue.mainQueue().addOperationWithBlock_(_deliver)
+
+
+class _Separator:
+    """Sentinel für eine Trennlinie im Menü."""
+    __slots__ = ()
+
+
+SEPARATOR = _Separator()
+
+
+class MenuEntry:
+    """Ein Menüeintrag als reine Daten (AppKit-frei, damit testbar).
+
+    ``key`` erlaubt spätere Titeländerungen **in place** (``StatusItem.set_item_title``) —
+    MailRelay aktualisiert Status/Warteschlange/Gesendet im 3-Sekunden-Takt, ein
+    Menü-Neuaufbau wäre dafür unnötig und würde ein geöffnetes Menü stören.
+    """
+
+    def __init__(self, title, callback=None, key=None, enabled=None):
+        self.title = title
+        self.callback = callback
+        self.key = key
+        self.enabled = enabled
+
+    def is_enabled(self):
+        """Aktiv, wenn explizit gesetzt — sonst automatisch bei vorhandenem Callback."""
+        if self.enabled is not None:
+            return self.enabled
+        return self.callback is not None
+
+
+class _MenuTarget(_NSObject):
+    """Einziges Target aller Menüeinträge; verteilt Klicks anhand des ``tag``.
+
+    Einer statt eines pro Eintrag, weil ``NSMenuItem.target`` eine *schwache* Referenz
+    ist — pro-Eintrag-Objekte würden deallokiert und die Klicks liefen ins Leere.
+    """
+
+    def menuAction_(self, sender):
+        cb = self._callbacks.get(int(sender.tag()))
+        if cb is None:
+            return
+        try:
+            cb()
+        except Exception:  # noqa: BLE001 - ein Klick darf die App nie killen
+            logging.getLogger(APP_NAME).exception("Menü-Callback fehlgeschlagen")
+
+
+class StatusItem:
+    """``NSStatusItem`` + ``NSMenu`` (Ersatz für ``rumps.App``)."""
+
     def __init__(self):
-        super().__init__(APP_NAME, icon=ICON, template=True, quit_button=None)
+        import AppKit
+
+        self._appkit = AppKit
+        self._item = AppKit.NSStatusBar.systemStatusBar().statusItemWithLength_(
+            AppKit.NSVariableStatusItemLength)
+        self._target = _MenuTarget.alloc().init()
+        self._target._callbacks = {}
+        self._by_key = {}
+        self._images = {}
+        self._cur_icon = None
+
+    def set_icon(self, path):
+        """Setzt das Template-Icon; No-op bei unverändertem Pfad (kein Flackern)."""
+        if not path or path == self._cur_icon:
+            return
+
+        def _apply():
+            from Foundation import NSMakeSize
+
+            img = self._images.get(path)
+            if img is None:
+                img = self._appkit.NSImage.alloc().initWithContentsOfFile_(path)
+                if img is None:
+                    return
+                img.setTemplate_(True)
+                # Ohne setSize_ deutet NSImage die Pixelmaße als Punkte -> viel zu groß.
+                img.setSize_(NSMakeSize(20.0, 20.0))
+                self._images[path] = img
+            self._item.button().setImage_(img)
+            self._cur_icon = path
+
+        _run_on_main_sync(_apply)
+
+    def set_menu(self, entries):
+        """Ersetzt das Menü vollständig durch die übergebene Spezifikation."""
+        def _apply():
+            AppKit = self._appkit
+            self._target._callbacks = {}
+            self._by_key = {}
+            menu = AppKit.NSMenu.alloc().init()
+            # Ohne dies aktiviert AppKit unsere bewusst deaktivierten Info-Zeilen wieder.
+            menu.setAutoenablesItems_(False)
+            tag = 0
+            for e in entries:
+                if e is SEPARATOR:
+                    menu.addItem_(AppKit.NSMenuItem.separatorItem())
+                    continue
+                item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                    e.title, None, "")
+                if e.callback is not None:
+                    self._target._callbacks[tag] = e.callback
+                    item.setTag_(tag)
+                    item.setTarget_(self._target)
+                    item.setAction_("menuAction:")
+                    tag += 1
+                item.setEnabled_(e.is_enabled())
+                if e.key:
+                    self._by_key[e.key] = item
+                menu.addItem_(item)
+            self._item.setMenu_(menu)
+
+        _run_on_main_sync(_apply)
+
+    def set_item_title(self, key, title):
+        """Ändert den Titel eines Eintrags ohne Menü-Neuaufbau. True, wenn ``key`` existiert."""
+        item = self._by_key.get(key)
+        if item is None:
+            return False
+        _run_on_main_sync(lambda: item.setTitle_(title))
+        return True
+
+
+class _TimerTarget(_NSObject):
+    """ObjC-Ziel für ``NSTimer`` (der Timer hält es stark, solange er lebt)."""
+
+    def fire_(self, _timer):
+        cb = getattr(self, "_callback", None)
+        if cb is None:
+            return
+        try:
+            cb()
+        except Exception:  # noqa: BLE001 - ein Tick darf die App nie killen
+            logging.getLogger(APP_NAME).exception("Timer-Callback fehlgeschlagen")
+
+
+class RepeatingTimer:
+    """Wiederholender Main-Thread-Timer (Ersatz für ``rumps.Timer``).
+
+    Läuft bewusst nur im ``NSDefaultRunLoopMode``: bei geöffnetem Menü ruht der Tick,
+    sonst würden Titeländerungen dem Nutzer ins offene Menü grätschen. ``rumps.Timer``
+    feuert sofort beim Start — das bildet ``fire_immediately`` nach.
+    """
+
+    def __init__(self, interval, callback, fire_immediately=False):
+        self._interval = max(0.1, float(interval))
+        self._target = _TimerTarget.alloc().init()
+        self._target._callback = callback
+        self._fire_immediately = fire_immediately
+        self._timer = None
+
+    def start(self):
+        def _apply():
+            if self._timer is not None:
+                return
+            from Foundation import NSDate, NSDefaultRunLoopMode, NSRunLoop, NSTimer
+
+            if self._fire_immediately:
+                t = NSTimer.alloc().initWithFireDate_interval_target_selector_userInfo_repeats_(
+                    NSDate.date(), self._interval, self._target, "fire:", None, True)
+                NSRunLoop.currentRunLoop().addTimer_forMode_(t, NSDefaultRunLoopMode)
+            else:
+                t = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                    self._interval, self._target, "fire:", None, True)
+            t.setTolerance_(self._interval * 0.1)
+            self._timer = t
+
+        _run_on_main_sync(_apply)
+
+    def stop(self):
+        def _apply():
+            if self._timer is not None:
+                self._timer.invalidate()
+                self._timer = None
+
+        _run_on_main_sync(_apply)
+
+
+# --------------------------------------------------------------- Menü-App ---
+class MailRelayApp:
+    def __init__(self):
+        self.status = StatusItem()
         secure_dir(SUPPORT)
         secure_dir(SPOOL)
         self.log = setup_logging()
@@ -908,42 +1179,42 @@ class MailRelayApp(rumps.App):
         self._pf_repair_alerted = False
         self._pf_last_check = 0.0
 
-        self.status_item = rumps.MenuItem("Status: gestoppt")
-        self.toggle_item = rumps.MenuItem("Start", callback=self.toggle)
-        self.queue_item = rumps.MenuItem("Warteschlange: 0", callback=self.flush_now)
-        self.sent_item = rumps.MenuItem("Gesendet: 0")
-
-        self.menu = [
-            self.status_item,
-            self.toggle_item,
-            None,
-            self.queue_item,
-            self.sent_item,
-            None,
-            rumps.MenuItem("Einstellungen…", callback=self.open_settings),
-            rumps.MenuItem("Log öffnen…", callback=self.open_log),
-            rumps.MenuItem("Konfigurationsdatei öffnen…", callback=self.open_config),
-            None,
-            rumps.MenuItem("Beenden", callback=self.quit_app),
-        ]
+        # Die vier oberen Einträge tragen einen `key`: ihre Titel wechseln zur Laufzeit
+        # (Status, Start/Stop, Warteschlange, Gesendet) und werden per set_item_title
+        # in place aktualisiert, ohne das Menü neu zu bauen.
+        self.status.set_menu([
+            MenuEntry("Status: gestoppt", key="status"),
+            MenuEntry("Start", self.toggle, key="toggle"),
+            SEPARATOR,
+            MenuEntry("Warteschlange: 0", self.flush_now, key="queue"),
+            MenuEntry("Gesendet: 0", key="sent"),
+            SEPARATOR,
+            MenuEntry("Einstellungen…", self.open_settings),
+            MenuEntry("Log öffnen…", self.open_log),
+            MenuEntry("Konfigurationsdatei öffnen…", self.open_config),
+            SEPARATOR,
+            MenuEntry("Beenden", self.quit_app),
+        ])
 
         self.update_icon()    # Initialzustand (gestoppt -> Outline)
 
-        # UI-Aktualisierung auf dem Main-Thread
-        rumps.Timer(self.tick, 3).start()
+        # UI-Aktualisierung auf dem Main-Thread. fire_immediately bildet das bisherige
+        # rumps-Verhalten ab (erster Tick sofort statt erst nach 3 s).
+        self.timer = RepeatingTimer(3, self.tick, fire_immediately=True)
+        self.timer.start()
 
         # Automatisch starten, wenn ein Upstream hinterlegt ist
         if self.cfg.get("upstream_host"):
             self.start_relay()
 
     # -------------------------------------------------------- Hilfsfunktionen
-    def tick(self, _):
+    def tick(self):
         try:
             n = len(list(SPOOL.glob("*.json")))
         except Exception:
             n = 0
-        self.queue_item.title = f"Warteschlange: {n}"
-        self.sent_item.title = f"Gesendet: {self.sent_count}"
+        self.status.set_item_title("queue", f"Warteschlange: {n}")
+        self.status.set_item_title("sent", f"Gesendet: {self.sent_count}")
         self._check_pf_alert()
 
     def _check_pf_alert(self):
@@ -1028,7 +1299,7 @@ class MailRelayApp(rumps.App):
         if symbol == self._cur_symbol:
             return
         self._cur_symbol = symbol
-        self.icon = self._icon_for(symbol)
+        self.status.set_icon(self._icon_for(symbol))
 
     # ----------------------------------------------------------- Start/Stop
     def start_relay(self):
@@ -1054,13 +1325,12 @@ class MailRelayApp(rumps.App):
             self.worker.start()
         except Exception as e:
             self.controller = None
-            rumps.alert(APP_NAME, f"Start fehlgeschlagen:\n{e}")
+            alert(APP_NAME, f"Start fehlgeschlagen:\n{e}")
             self.log.error("Start fehlgeschlagen: %s", e)
             return
-        self.status_item.title = (
-            f"Status: läuft ({self.cfg['listen_host']}:{self.cfg['listen_port']})"
-        )
-        self.toggle_item.title = "Stop"
+        self.status.set_item_title(
+            "status", f"Status: läuft ({self.cfg['listen_host']}:{self.cfg['listen_port']})")
+        self.status.set_item_title("toggle", "Stop")
         self.update_icon()
         self.log.info("Relay gestartet auf %s:%s",
                       self.cfg["listen_host"], self.cfg["listen_port"])
@@ -1072,7 +1342,7 @@ class MailRelayApp(rumps.App):
                 "OFFENES RELAY: lauscht auf %s ohne Peer-Allowlist – jedes "
                 "erreichbare Gerät kann über den Upstream versenden.", host
             )
-            rumps.notification(
+            notify(
                 APP_NAME, "Sicherheitshinweis",
                 "Relay ist im Netz offen erreichbar. Unter Einstellungen → "
                 "„Erlaubte Absender…“ einschränken oder Listen-Host 127.0.0.1.",
@@ -1085,12 +1355,12 @@ class MailRelayApp(rumps.App):
         if self.worker:
             self.worker.stop()
             self.worker = None
-        self.status_item.title = "Status: gestoppt"
-        self.toggle_item.title = "Start"
+        self.status.set_item_title("status", "Status: gestoppt")
+        self.status.set_item_title("toggle", "Start")
         self.update_icon()
         self.log.info("Relay gestoppt")
 
-    def toggle(self, _):
+    def toggle(self):
         if self.controller:
             self.stop_relay()
         else:
@@ -1102,7 +1372,7 @@ class MailRelayApp(rumps.App):
             self.stop_relay()
             self.start_relay()
 
-    def open_settings(self, _):
+    def open_settings(self):
         """Öffnet das native PyObjC-Einstellungsfenster (alle Felder auf einen Blick)."""
         sections = [
             ("Listener", [
@@ -1153,7 +1423,7 @@ class MailRelayApp(rumps.App):
             # open_settings nicht mehr auf ein Ergebnis warten (s. run_settings_window).
             if saved:
                 for note in self._settings_notices:
-                    rumps.alert(APP_NAME, note)
+                    alert(APP_NAME, note)
 
         run_settings_window("MailRelay – Einstellungen", sections, initial,
                             self._commit_settings, _done)
@@ -1217,7 +1487,7 @@ class MailRelayApp(rumps.App):
         return []
 
     # ----------------------------------------------------------- Aktionen
-    def flush_now(self, _):
+    def flush_now(self):
         for f in SPOOL.glob("*.json"):
             try:
                 rec = json.loads(f.read_text())
@@ -1225,20 +1495,37 @@ class MailRelayApp(rumps.App):
                 write_private(f, json.dumps(rec))
             except Exception:
                 pass
-        rumps.notification(APP_NAME, "", "Warteschlange wird jetzt erneut zugestellt.")
+        notify(APP_NAME, "", "Warteschlange wird jetzt erneut zugestellt.")
 
-    def open_config(self, _):
+    def open_config(self):
         save_config(self.cfg)
         subprocess.run(["open", str(CONFIG_PATH)])
 
-    def open_log(self, _):
+    def open_log(self):
         LOG_PATH.touch(exist_ok=True)
         subprocess.run(["open", str(LOG_PATH)])
 
-    def quit_app(self, _):
+    def quit_app(self):
+        import AppKit
+
+        self.timer.stop()
         self.stop_relay()
-        rumps.quit_application()
+        AppKit.NSApplication.sharedApplication().terminate_(None)
+
+
+def main():
+    """Startet die Menüleisten-App und übergibt an den AppKit-Runloop."""
+    import AppKit
+
+    ns_app = AppKit.NSApplication.sharedApplication()
+    # „Accessory": Menüleisten-Resident ohne Dock-Icon (entspricht LSUIElement, gilt
+    # aber auch im Dev-Modus ohne Bundle).
+    ns_app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
+    app = MailRelayApp()   # Referenz halten: Status-Item und Timer hängen daran
+    logging.getLogger(APP_NAME).info("Menüleisten-Item aktiv, Runloop startet.")
+    ns_app.run()
+    del app
 
 
 if __name__ == "__main__":
-    MailRelayApp().run()
+    main()

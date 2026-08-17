@@ -5,7 +5,7 @@ einem anderen Mac). Quelle der Wahrheit ist der Code + `git log`; diese Datei
 fasst Stand und Entscheidungen zusammen.
 
 ## Was ist das
-Native macOS-Menüleisten-App (Python + `rumps` + `aiosmtpd`), die als
+Native macOS-Menüleisten-App (Python + PyObjC/AppKit + `aiosmtpd`), die als
 SMTP-Relay/Smarthost dient: nimmt lokal Mails an, legt sie in eine Disk-Queue
 und stellt sie an einen Upstream-SMTP zu (mit AUTH/STARTTLS, Retry/Backoff).
 Build als `.app` via `py2app`. Repo: `https://github.com/nicx/mailrelay`.
@@ -73,13 +73,30 @@ make run PYTHON=/opt/homebrew/bin/python3.13          # aus Quelltext testen
   zurückbauen. Symptom, falls doch: Menüs ausgegraut, `sample <pid>` zeigt den Main-Thread
   in `-[NSApplication runModalForWindow:]`.
 
-## Richtung: rumps → PyObjC (gestaffelt, analog evcc-menu)
-Strategie der Python-Familie: bei Python bleiben, UI schrittweise auf PyObjC
-vereinheitlichen, rumps mittelfristig ablösen (eine Sprache, ein Repo, Tests bleiben,
-kein IPC). Der aktuelle Dual-Style (rumps-Menü + PyObjC-Fenster) ist Übergang. Erledigt:
-Settings-Fenster (Baustein 1). Offen: gemeinsames `menubar-ui`-Modul extrahieren +
-icloud-sync/evcc darauf umstellen; dann `NSAlert`-Helfer, `NSStatusItem`+`NSMenu`,
-`NSTimer`, Notifications, eigene Runloop → rumps raus.
+## Richtung: PyObjC (abgeschlossen)
+Strategie der Python-Familie: bei Python bleiben, UI vollständig auf PyObjC
+vereinheitlichen (eine Sprache, ein Repo, Tests bleiben, kein IPC). **Seit 2026-08-17
+erledigt** — `rumps` ist aus Code, `requirements.txt` und Bundle raus, wie zuvor schon
+bei evcc und icloud-sync.
+
+- Baustein 1: Settings-Fenster (`run_settings_window` + `parse_relay_settings`).
+- Baustein 2: `StatusItem` (`NSStatusItem`/`NSMenu`), `RepeatingTimer` (`NSTimer`),
+  `alert` (`NSAlert`), `notify` (`UNUserNotificationCenter`), eigene
+  `NSApplication`-Runloop in `main()`.
+
+Beide Bausteine sind bewusst **app-agnostisch** gehalten, damit sie später unverändert in
+ein gemeinsames `menubar-ui`-Modul der Python-Familie (mailrelay/icloud-sync/evcc) wandern
+können — das Extrahieren ist der verbleibende, rein organisatorische Schritt.
+
+**Zwei Verhaltensdetails, die beim Umbau bewusst erhalten wurden:**
+- Die Menüeinträge Status/Start-Stop/Warteschlange/Gesendet ändern ihren Titel zur
+  Laufzeit. Statt das Menü im 3-Sekunden-Takt neu zu bauen (was ein **geöffnetes** Menü
+  stören würde), tragen sie einen stabilen `key`; `StatusItem.set_item_title` ändert den
+  Titel am selben `NSMenuItem`.
+- `rumps.Timer` feuerte sofort beim Start, `NSTimer.scheduledTimer…` erst nach dem ersten
+  Intervall. Dafür gibt es `RepeatingTimer(fire_immediately=True)`.
+- Der UI-Timer läuft nur im `NSDefaultRunLoopMode` — bei geöffnetem Menü ruht er, genau
+  wie zuvor rumps.
 
 ## Was NICHT im Repo liegt (pro-Mac neu einrichten)
 - Laufzeit-Config `~/Library/Application Support/MailRelay/config.json`
@@ -87,7 +104,9 @@ icloud-sync/evcc darauf umstellen; dann `NSAlert`-Helfer, `NSStatusItem`+`NSMenu
 - Build-Artefakte (`dist/`, `build/`, `.venv/`), `assets/icon.icns` – regenerierbar.
 
 ## Offene/optionale Punkte
-- Code-Signing + Notarisierung (Developer-ID) gegen Gatekeeper – noch offen.
+- Notarisierung (Developer-ID) gegen Gatekeeper – noch offen. Code-Signing läuft seit
+  2026-08-17 über die stabile Identität `nicx Selfsign`:
+  `CODESIGN_IDENTITY="nicx Selfsign" make app`.
 - Optionaler GitHub-Actions-Release-Workflow (macOS-Runner, App bei Tag bauen).
 - ~~Security-Finding M2 (Keychain-Passwort via `security`-CLI in `ps` sichtbar)~~ –
   **erledigt:** Keychain läuft jetzt über die `keyring`-Library (Security-Framework),

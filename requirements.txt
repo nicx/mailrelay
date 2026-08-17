@@ -1,3 +1,6 @@
-rumps>=0.4.0
+# Laufzeit-Abhängigkeiten. Die UI ist vollständig PyObjC/AppKit — rumps ist mit der
+# Umstellung entfallen (Statusleiste, Menü, Timer, Dialoge, Notifications sind nativ).
+pyobjc-framework-Cocoa>=12.0            # AppKit/Foundation: Statusleiste, Menü, Fenster, Timer
+pyobjc-framework-UserNotifications>=12.0 # macOS-Notifications
 aiosmtpd>=1.4.6
 keyring>=24
