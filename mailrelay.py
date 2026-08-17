@@ -457,7 +457,10 @@ def setup_logging():
     log = logging.getLogger(APP_NAME)
     if not log.handlers:
         log.setLevel(logging.INFO)
-        h = logging.FileHandler(LOG_PATH)
+        # encoding explizit: im py2app-Bundle ist keine Locale gesetzt, sonst fällt der
+        # Handler auf ASCII zurück und JEDE deutsche Meldung (Umlaut, Gedankenstrich)
+        # scheitert mit UnicodeEncodeError — die Zeile fehlt dann still im Log.
+        h = logging.FileHandler(LOG_PATH, encoding="utf-8")
         h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
         log.addHandler(h)
     _chmod(LOG_PATH, FILE_MODE)
